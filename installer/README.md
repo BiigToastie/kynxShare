@@ -27,7 +27,7 @@ npm install
 npm run tauri build
 ```
 
-Artifacts land in `apps/desktop/src-tauri/target/release/bundle/` (NSIS + MSI when configured).
+Artifacts land in `target/release/bundle/` at the **repo root** (Cargo workspace), e.g. `target/release/bundle/nsis/kynxShare_*_x64-setup.exe`.
 
 ## Optional companion
 

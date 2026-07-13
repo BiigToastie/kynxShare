@@ -2,7 +2,7 @@
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
-title kynxShare — Build & Install
+title kynxShare - Build and Install
 color 0A
 
 echo.
@@ -45,22 +45,36 @@ popd
 echo.
 echo [3/3] Locating installer...
 
-set "BUNDLE=apps\desktop\src-tauri\target\release\bundle"
 set "INSTALLER="
 
-REM Prefer NSIS .exe, then MSI
-for %%F in ("%BUNDLE%\nsis\*.exe") do (
-  set "INSTALLER=%%~fF"
-  goto :found
-)
-for %%F in ("%BUNDLE%\msi\*.msi") do (
-  set "INSTALLER=%%~fF"
-  goto :found
+REM Cargo workspace puts artifacts in repo-root target/ (not src-tauri/target)
+for %%D in (
+  "target\release\bundle\nsis"
+  "apps\desktop\src-tauri\target\release\bundle\nsis"
+) do (
+  if exist "%%~D\*.exe" (
+    for %%F in ("%%~D\*.exe") do (
+      set "INSTALLER=%%~fF"
+      goto :found
+    )
+  )
 )
 
-echo [ERROR] No installer found under:
-echo   %BUNDLE%\nsis\  or  %BUNDLE%\msi\
-echo Build may have succeeded without bundling. Check the Tauri build log.
+for %%D in (
+  "target\release\bundle\msi"
+  "apps\desktop\src-tauri\target\release\bundle\msi"
+) do (
+  if exist "%%~D\*.msi" (
+    for %%F in ("%%~D\*.msi") do (
+      set "INSTALLER=%%~fF"
+      goto :found
+    )
+  )
+)
+
+echo [ERROR] No installer found. Expected under:
+echo   target\release\bundle\nsis\
+echo   target\release\bundle\msi\
 goto :fail
 
 :found
