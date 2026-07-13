@@ -13,7 +13,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["kynxShare Contributors"]
-repository = "https://github.com/kynxShare/kynxShare"
+repository = "https://github.com/BiigToastie/kynxShare"
 
 [workspace.dependencies]
 anyhow = "1"
