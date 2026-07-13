@@ -1,0 +1,28 @@
+name: Bug report
+description: Something broken in capture, compose, or Discord sharing
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Expected vs actual behavior
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+      placeholder: e.g. Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: monitors
+    attributes:
+      label: Monitor setup
+      placeholder: e.g. 2560x1440 + 1920x1080
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / steps
+      description: How to reproduce; any RUST_LOG output

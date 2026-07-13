@@ -1,0 +1,14 @@
+[package]
+name = "kynx-compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layout engine and frame compositor for kynxShare"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+kynx-capture = { path = "../kynx-capture" }

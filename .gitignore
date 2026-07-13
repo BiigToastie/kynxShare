@@ -1,0 +1,15 @@
+/target
+**/target
+apps/desktop/dist
+apps/desktop/node_modules
+apps/desktop/src-tauri/target
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*
+.idea
+.vscode/*
+!.vscode/extensions.json
+Cargo.lock.bak
+*.pdb

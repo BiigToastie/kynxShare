@@ -1,0 +1,374 @@
+use crate::config::AppConfig;
+use anyhow::{Context, Result};
+use kynx_capture::{enumerate_monitors, MonitorInfo, MultiCapture};
+use kynx_compositor::{compose_frame, LayoutConfig, OutputMode};
+use kynx_output::{
+    detect_virtual_display_driver, ShareWindow, VirtualCamera, VirtualDisplayStatus,
+};
+use parking_lot::Mutex;
+use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::{info, warn};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineStatus {
+    pub running: bool,
+    pub output_active: bool,
+    pub mode: OutputMode,
+    pub fps: f32,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
+    pub monitor_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineSnapshot {
+    pub status: EngineStatus,
+    pub monitors: Vec<MonitorInfo>,
+    pub layout: LayoutConfig,
+    pub vdd: VirtualDisplayStatus,
+    pub preview_jpeg_base64: Option<String>,
+}
+
+pub struct KynxEngine {
+    config: Arc<Mutex<AppConfig>>,
+    monitors: Arc<Mutex<Vec<MonitorInfo>>>,
+    capture: Arc<Mutex<Option<MultiCapture>>>,
+    share: Arc<Mutex<Option<ShareWindow>>>,
+    vcam: Arc<Mutex<Option<VirtualCamera>>>,
+    running: Arc<AtomicBool>,
+    output_active: Arc<AtomicBool>,
+    loop_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    latest_preview: Arc<Mutex<Option<Vec<u8>>>>,
+    latest_status: Arc<Mutex<EngineStatus>>,
+    prev_viewport: Arc<Mutex<Option<(f32, f32)>>>,
+}
+
+impl KynxEngine {
+    pub fn new(config: AppConfig) -> Result<Self> {
+        let monitors = enumerate_monitors().unwrap_or_default();
+        let mut cfg = config;
+        if cfg.layout.placements.is_empty() && !monitors.is_empty() {
+            cfg.layout = LayoutConfig::from_monitors(&monitors);
+            cfg.selected_monitor_ids = monitors.iter().map(|m| m.id.clone()).collect();
+        }
+        let (cw, ch) = cfg.layout.resolve_canvas_size(&monitors);
+        Ok(Self {
+            config: Arc::new(Mutex::new(cfg)),
+            monitors: Arc::new(Mutex::new(monitors.clone())),
+            capture: Arc::new(Mutex::new(None)),
+            share: Arc::new(Mutex::new(None)),
+            vcam: Arc::new(Mutex::new(None)),
+            running: Arc::new(AtomicBool::new(false)),
+            output_active: Arc::new(AtomicBool::new(false)),
+            loop_handle: Mutex::new(None),
+            latest_preview: Arc::new(Mutex::new(None)),
+            latest_status: Arc::new(Mutex::new(EngineStatus {
+                running: false,
+                output_active: false,
+                mode: OutputMode::StaticLayout,
+                fps: 0.0,
+                canvas_width: cw,
+                canvas_height: ch,
+                monitor_count: monitors.len(),
+            })),
+            prev_viewport: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    pub fn refresh_monitors(&self) -> Result<Vec<MonitorInfo>> {
+        let monitors = enumerate_monitors()?;
+        *self.monitors.lock() = monitors.clone();
+        Ok(monitors)
+    }
+
+    pub fn get_config(&self) -> AppConfig {
+        self.config.lock().clone()
+    }
+
+    pub fn update_config(&self, cfg: AppConfig) -> Result<()> {
+        cfg.save()?;
+        *self.config.lock() = cfg;
+        Ok(())
+    }
+
+    pub fn status(&self) -> EngineStatus {
+        self.latest_status.lock().clone()
+    }
+
+    pub fn preview_jpeg(&self) -> Option<Vec<u8>> {
+        self.latest_preview.lock().clone()
+    }
+
+    pub fn vdd_status(&self) -> VirtualDisplayStatus {
+        detect_virtual_display_driver()
+    }
+
+    pub fn snapshot(&self) -> EngineSnapshot {
+        let cfg = self.config.lock().clone();
+        let monitors = self.monitors.lock().clone();
+        let preview = self.preview_jpeg().map(|b| base64_encode(&b));
+        EngineSnapshot {
+            status: self.status(),
+            monitors,
+            layout: cfg.layout,
+            vdd: self.vdd_status(),
+            preview_jpeg_base64: preview,
+        }
+    }
+
+    pub fn start(&self) -> Result<()> {
+        if self.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let monitors = self.monitors.lock().clone();
+        let cfg = self.config.lock().clone();
+        let selected: Vec<MonitorInfo> = monitors
+            .iter()
+            .filter(|m| {
+                cfg.selected_monitor_ids.is_empty()
+                    || cfg.selected_monitor_ids.iter().any(|id| id == &m.id)
+            })
+            .cloned()
+            .collect();
+
+        let capture = MultiCapture::start(selected).context("start capture")?;
+        *self.capture.lock() = Some(capture);
+
+        if cfg.outputs.share_window {
+            let mut sw_cfg = cfg.share_window.clone();
+            sw_cfg.always_on_top = cfg.outputs.always_on_top;
+            sw_cfg.visible = true;
+            match ShareWindow::create(sw_cfg) {
+                Ok(w) => *self.share.lock() = Some(w),
+                Err(e) => warn!("share window failed: {e}"),
+            }
+        }
+
+        let mut vcam_cfg = cfg.virtual_camera.clone();
+        vcam_cfg.enabled = cfg.outputs.virtual_camera;
+        match VirtualCamera::open(vcam_cfg) {
+            Ok(v) => *self.vcam.lock() = Some(v),
+            Err(e) => warn!("virtual camera mapping failed: {e}"),
+        }
+
+        self.running.store(true, Ordering::SeqCst);
+        self.output_active.store(true, Ordering::SeqCst);
+
+        let config = Arc::clone(&self.config);
+        let monitors_arc = Arc::clone(&self.monitors);
+        let capture = Arc::clone(&self.capture);
+        let share = Arc::clone(&self.share);
+        let vcam = Arc::clone(&self.vcam);
+        let running = Arc::clone(&self.running);
+        let output_active = Arc::clone(&self.output_active);
+        let latest_preview = Arc::clone(&self.latest_preview);
+        let latest_status = Arc::clone(&self.latest_status);
+        let prev_viewport = Arc::clone(&self.prev_viewport);
+
+        let handle = std::thread::Builder::new()
+            .name("kynx-engine".into())
+            .spawn(move || {
+                let mut last_fps_t = Instant::now();
+                let mut frames = 0u32;
+                let mut fps = 0.0f32;
+
+                while running.load(Ordering::SeqCst) {
+                    let cfg = config.lock().clone();
+                    let frame_budget =
+                        Duration::from_secs_f64(1.0 / cfg.target_fps.max(1) as f64);
+                    let start = Instant::now();
+
+                    let monitors = monitors_arc.lock().clone();
+                    let frames_map = {
+                        let guard = capture.lock();
+                        guard.as_ref().map(|c| c.snapshot()).unwrap_or_default()
+                    };
+
+                    let cursor = get_cursor_pos();
+                    let prev = *prev_viewport.lock();
+                    let composed =
+                        compose_frame(&frames_map, &monitors, &cfg.layout, cursor, prev);
+                    if let Some(vp) = composed.viewport {
+                        *prev_viewport.lock() = Some((vp.x, vp.y));
+                    }
+
+                    if output_active.load(Ordering::SeqCst) {
+                        if let Some(w) = share.lock().as_ref() {
+                            let _ = w.present(composed.width, composed.height, &composed.pixels);
+                        }
+                        if let Some(v) = vcam.lock().as_ref() {
+                            let ts = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            v.push_frame(composed.width, composed.height, &composed.pixels, ts);
+                        }
+                    }
+
+                    if let Some(jpeg) =
+                        encode_preview_jpeg(&composed.pixels, composed.width, composed.height, 960)
+                    {
+                        *latest_preview.lock() = Some(jpeg);
+                    }
+
+                    frames += 1;
+                    if last_fps_t.elapsed() >= Duration::from_secs(1) {
+                        fps = frames as f32 / last_fps_t.elapsed().as_secs_f32();
+                        frames = 0;
+                        last_fps_t = Instant::now();
+                    }
+
+                    let (cw, ch) = cfg.layout.resolve_canvas_size(&monitors);
+                    *latest_status.lock() = EngineStatus {
+                        running: true,
+                        output_active: output_active.load(Ordering::SeqCst),
+                        mode: cfg.layout.mode,
+                        fps,
+                        canvas_width: if cfg.layout.mode == OutputMode::MouseFollow {
+                            composed.width
+                        } else {
+                            cw
+                        },
+                        canvas_height: if cfg.layout.mode == OutputMode::MouseFollow {
+                            composed.height
+                        } else {
+                            ch
+                        },
+                        monitor_count: monitors.len(),
+                    };
+
+                    let elapsed = start.elapsed();
+                    if elapsed < frame_budget {
+                        std::thread::sleep(frame_budget - elapsed);
+                    }
+                }
+            })?;
+
+        *self.loop_handle.lock() = Some(handle);
+        info!("kynxShare engine started");
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.output_active.store(false, Ordering::SeqCst);
+        if let Some(h) = self.loop_handle.lock().take() {
+            let _ = h.join();
+        }
+        if let Some(c) = self.capture.lock().take() {
+            c.stop();
+        }
+        if let Some(s) = self.share.lock().take() {
+            s.close();
+        }
+        if let Some(v) = self.vcam.lock().take() {
+            v.close();
+        }
+        let mut st = self.latest_status.lock();
+        st.running = false;
+        st.output_active = false;
+        info!("kynxShare engine stopped");
+    }
+
+    pub fn set_output_active(&self, active: bool) {
+        self.output_active.store(active, Ordering::SeqCst);
+        if let Some(share) = self.share.lock().as_ref() {
+            share.set_visible(active);
+        }
+        if let Some(vcam) = self.vcam.lock().as_ref() {
+            let enabled = active && self.config.lock().outputs.virtual_camera;
+            vcam.set_enabled(enabled);
+        }
+    }
+
+    pub fn toggle_mode(&self) -> Result<OutputMode> {
+        let mut cfg = self.config.lock().clone();
+        cfg.layout.mode = match cfg.layout.mode {
+            OutputMode::StaticLayout => OutputMode::MouseFollow,
+            OutputMode::MouseFollow => OutputMode::StaticLayout,
+        };
+        let mode = cfg.layout.mode;
+        cfg.save()?;
+        *self.config.lock() = cfg;
+        Ok(mode)
+    }
+}
+
+impl Drop for KynxEngine {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn get_cursor_pos() -> Option<(i32, i32)> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                return Some((pt.x, pt.y));
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn encode_preview_jpeg(bgra: &[u8], width: u32, height: u32, max_w: u32) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || bgra.len() < (width * height * 4) as usize {
+        return None;
+    }
+    let scale = (max_w as f32 / width as f32).min(1.0);
+    let pw = ((width as f32 * scale).round() as u32).max(1);
+    let ph = ((height as f32 * scale).round() as u32).max(1);
+    let mut rgb = vec![0u8; (pw * ph * 3) as usize];
+    for y in 0..ph {
+        let sy = ((y as u64 * height as u64) / ph as u64) as u32;
+        for x in 0..pw {
+            let sx = ((x as u64 * width as u64) / pw as u64) as u32;
+            let si = ((sy * width + sx) * 4) as usize;
+            let di = ((y * pw + x) * 3) as usize;
+            rgb[di] = bgra[si + 2];
+            rgb[di + 1] = bgra[si + 1];
+            rgb[di + 2] = bgra[si];
+        }
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 70);
+    encoder
+        .encode(&rgb, pw, ph, image::ExtendedColorType::Rgb8)
+        .ok()?;
+    Some(out.into_inner())
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let c = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (a << 16) | (b << 8) | c;
+        out.push(T[((triple >> 18) & 63) as usize] as char);
+        out.push(T[((triple >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[((triple >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(triple & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}

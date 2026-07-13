@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/kynx-capture",
+  "crates/kynx-compositor",
+  "crates/kynx-output",
+  "crates/kynx-core",
+  "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["kynxShare Contributors"]
+repository = "https://github.com/kynxShare/kynxShare"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+directories = "6"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
