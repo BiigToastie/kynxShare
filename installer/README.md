@@ -15,7 +15,11 @@ npm install
 npm run tauri dev
 ```
 
-## Release installer
+## One-click build & install (Windows)
+
+Double-click **`build.bat`** in the project root. It runs `npm install`, builds the Tauri release installer, then launches it.
+
+## Release installer (manual)
 
 ```bash
 cd apps/desktop

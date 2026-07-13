@@ -34,8 +34,10 @@ More detail: [docs/discord.md](docs/discord.md)
 
 ## Quick start (developers)
 
+**One-click build & install:** double-click [`build.bat`](build.bat) in the project root (needs Rust, Node 20+, VS C++ Build Tools, WebView2).
+
 ```bash
-# prerequisites: Rust, Node 20+, VS C++ Build Tools, WebView2
+# or run the UI in dev mode
 cd apps/desktop
 npm install
 npm run tauri dev
