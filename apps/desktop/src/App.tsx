@@ -605,7 +605,7 @@ export default function App() {
                 type="number"
                 value={config.target_fps}
                 onChange={(e) =>
-                  setConfig({ ...config, target_fps: Number(e.target.value) || 30 })
+                  setConfig({ ...config, target_fps: Number(e.target.value) || 60 })
                 }
                 onBlur={() => config && applyLive(config)}
               />

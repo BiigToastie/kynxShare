@@ -104,7 +104,7 @@ fn stub_frame(monitor: &MonitorInfo) -> CapturedFrame {
         height: h,
         stride: w * 4,
         format: FramePixelFormat::Bgra8,
-        pixels,
+        pixels: pixels.into(),
         timestamp_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

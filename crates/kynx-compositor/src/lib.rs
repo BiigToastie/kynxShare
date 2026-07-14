@@ -4,7 +4,9 @@ mod compose;
 mod layout;
 mod mouse_follow;
 
-pub use compose::{compose_frame, ComposedFrame, ComposeResult};
+pub use compose::{
+    compose_frame, compose_frame_with_options, ComposedFrame, ComposeOptions, ComposeResult,
+};
 pub use layout::{
     apply_desktop_arrangement, auto_layout_side_by_side, compute_native_canvas_size,
     layout_from_desktop, snap_placement, sync_layout_with_monitors, LayoutConfig, MonitorPlacement,

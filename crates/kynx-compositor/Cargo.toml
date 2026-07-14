@@ -11,4 +11,5 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+rayon = { workspace = true }
 kynx-capture = { path = "../kynx-capture" }

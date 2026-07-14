@@ -1,7 +1,9 @@
 use crate::config::AppConfig;
 use anyhow::{Context, Result};
 use kynx_capture::{enumerate_monitors, MonitorInfo, MultiCapture};
-use kynx_compositor::{compose_frame, sync_layout_with_monitors, LayoutConfig, OutputMode};
+use kynx_compositor::{
+    compose_frame_with_options, sync_layout_with_monitors, ComposeOptions, LayoutConfig, OutputMode,
+};
 use kynx_output::{
     detect_virtual_display_driver, ShareWindow, VirtualCamera, VirtualDisplayStatus,
 };
@@ -11,6 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+/// UI preview encode cadence (~12 FPS). Keeps the compose/present path at target FPS.
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(80);
+const PREVIEW_MAX_WIDTH: u32 = 960;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineStatus {
@@ -70,6 +76,10 @@ impl KynxEngine {
                 .collect();
         }
         cfg.layout.follow.apply_radius();
+        // Migrate legacy default (30 → 60).
+        if cfg.target_fps == 30 {
+            cfg.target_fps = 60;
+        }
         let (cw, ch) = cfg.layout.native_canvas_size(&monitors);
         let (ow, oh) = cfg.layout.resolve_canvas_size(&monitors);
         Ok(Self {
@@ -316,11 +326,16 @@ impl KynxEngine {
                 let mut last_fps_t = Instant::now();
                 let mut frames = 0u32;
                 let mut fps = 0.0f32;
+                let mut last_preview = Instant::now()
+                    .checked_sub(PREVIEW_INTERVAL)
+                    .unwrap_or_else(Instant::now);
+                let mut canvas_w = 0u32;
+                let mut canvas_h = 0u32;
 
                 while running.load(Ordering::SeqCst) {
                     let cfg = config.lock().clone();
-                    let frame_budget =
-                        Duration::from_secs_f64(1.0 / cfg.target_fps.max(1) as f64);
+                    let target_fps = cfg.target_fps.max(1).min(240);
+                    let frame_budget = Duration::from_secs_f64(1.0 / target_fps as f64);
                     let start = Instant::now();
 
                     let monitors = monitors_arc.lock().clone();
@@ -329,20 +344,38 @@ impl KynxEngine {
                         guard.as_ref().map(|c| c.snapshot()).unwrap_or_default()
                     };
 
+                    let need_layout_preview = last_preview.elapsed() >= PREVIEW_INTERVAL;
                     let cursor = get_cursor_pos();
                     let prev = *prev_viewport.lock();
-                    let composed =
-                        compose_frame(&frames_map, &monitors, &cfg.layout, cursor, prev);
+                    let composed = compose_frame_with_options(
+                        &frames_map,
+                        &monitors,
+                        &cfg.layout,
+                        cursor,
+                        prev,
+                        ComposeOptions {
+                            include_layout: need_layout_preview,
+                        },
+                    );
                     if let Some(vp) = composed.output.viewport {
                         *prev_viewport.lock() = Some((vp.x, vp.y));
                     }
 
+                    if let Some(layout) = &composed.layout {
+                        canvas_w = layout.width;
+                        canvas_h = layout.height;
+                    } else if canvas_w == 0 {
+                        let (cw, ch) = cfg.layout.native_canvas_size(&monitors);
+                        canvas_w = cw;
+                        canvas_h = ch;
+                    }
+
                     if output_active.load(Ordering::SeqCst) {
                         if let Some(w) = share.lock().as_ref() {
-                            let _ = w.present(
+                            let _ = w.present_arc(
                                 composed.output.width,
                                 composed.output.height,
-                                &composed.output.pixels,
+                                Arc::clone(&composed.output.pixels),
                             );
                         }
                         if let Some(v) = vcam.lock().as_ref() {
@@ -359,21 +392,27 @@ impl KynxEngine {
                         }
                     }
 
-                    if let Some(jpeg) = encode_preview_jpeg(
-                        &composed.layout.pixels,
-                        composed.layout.width,
-                        composed.layout.height,
-                        1600,
-                    ) {
-                        *latest_layout_preview.lock() = Some(jpeg);
-                    }
-                    if let Some(jpeg) = encode_preview_jpeg(
-                        &composed.output.pixels,
-                        composed.output.width,
-                        composed.output.height,
-                        1600,
-                    ) {
-                        *latest_output_preview.lock() = Some(jpeg);
+                    // JPEG previews are UI-only — never block the 60 FPS present path every frame.
+                    if need_layout_preview {
+                        if let Some(layout) = &composed.layout {
+                            if let Some(jpeg) = encode_preview_jpeg(
+                                &layout.pixels,
+                                layout.width,
+                                layout.height,
+                                PREVIEW_MAX_WIDTH,
+                            ) {
+                                *latest_layout_preview.lock() = Some(jpeg);
+                            }
+                        }
+                        if let Some(jpeg) = encode_preview_jpeg(
+                            &composed.output.pixels,
+                            composed.output.width,
+                            composed.output.height,
+                            PREVIEW_MAX_WIDTH,
+                        ) {
+                            *latest_output_preview.lock() = Some(jpeg);
+                        }
+                        last_preview = Instant::now();
                     }
 
                     frames += 1;
@@ -388,8 +427,8 @@ impl KynxEngine {
                         output_active: output_active.load(Ordering::SeqCst),
                         mode: cfg.layout.mode,
                         fps,
-                        canvas_width: composed.layout.width,
-                        canvas_height: composed.layout.height,
+                        canvas_width: canvas_w,
+                        canvas_height: canvas_h,
                         output_width: composed.output.width,
                         output_height: composed.output.height,
                         monitor_count: monitors.len(),
@@ -512,7 +551,7 @@ fn encode_preview_jpeg(bgra: &[u8], width: u32, height: u32, max_w: u32) -> Opti
         }
     }
     let mut out = std::io::Cursor::new(Vec::new());
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 70);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 65);
     encoder
         .encode(&rgb, pw, ph, image::ExtendedColorType::Rgb8)
         .ok()?;

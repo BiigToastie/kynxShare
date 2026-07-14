@@ -376,7 +376,7 @@ impl DxgiOutputCapture {
             height,
             stride,
             format: FramePixelFormat::Bgra8,
-            pixels,
+            pixels: pixels.into(),
             timestamp_ms,
         })
     }

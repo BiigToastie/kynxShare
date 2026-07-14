@@ -1,14 +1,14 @@
 use super::ShareWindowConfig;
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject,
     EndPaint, FillRect, InvalidateRect, SelectObject, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -28,11 +28,23 @@ const WM_KYNX_RESIZE: u32 = WM_USER + 44;
 struct FrameBuffer {
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    pixels: Arc<[u8]>,
 }
+
+struct CachedDib {
+    width: u32,
+    height: u32,
+    hdc_mem: HDC,
+    hbmp: HBITMAP,
+    bits: *mut u8,
+}
+
+// SAFETY: only touched on the share-window UI thread.
+unsafe impl Send for CachedDib {}
 
 struct WindowState {
     frame: Mutex<Option<FrameBuffer>>,
+    dib: Mutex<Option<CachedDib>>,
 }
 
 pub struct ShareWindow {
@@ -40,6 +52,7 @@ pub struct ShareWindow {
     state: Arc<WindowState>,
     running: Arc<AtomicBool>,
     closed: AtomicBool,
+    last_size: AtomicU64,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -77,6 +90,7 @@ impl ShareWindow {
             state,
             running,
             closed: AtomicBool::new(false),
+            last_size: AtomicU64::new(0),
             thread: Mutex::new(Some(thread)),
         })
     }
@@ -89,15 +103,52 @@ impl ShareWindow {
         if bgra.len() < expected {
             return Err(anyhow!("frame buffer too small"));
         }
+
+        // Prefer Arc clone when caller already has Arc<[u8]> via transmute path —
+        // here we still need an owned Arc from the slice.
+        let pixels: Arc<[u8]> = Arc::from(&bgra[..expected]);
+
         *self.state.frame.lock() = Some(FrameBuffer {
             width,
             height,
-            pixels: bgra[..expected].to_vec(),
+            pixels,
         });
+
+        let packed_size = ((width as u64) << 32) | (height as u64);
+        let prev = self.last_size.swap(packed_size, Ordering::Relaxed);
         unsafe {
-            // Pack width/height into LPARAM for optional resize hint
-            let packed = ((width.min(0xFFFF) as isize) << 16) | (height.min(0xFFFF) as isize);
-            let _ = PostMessageW(Some(self.hwnd), WM_KYNX_RESIZE, WPARAM(0), LPARAM(packed));
+            if prev != packed_size {
+                let packed =
+                    ((width.min(0xFFFF) as isize) << 16) | (height.min(0xFFFF) as isize);
+                let _ = PostMessageW(Some(self.hwnd), WM_KYNX_RESIZE, WPARAM(0), LPARAM(packed));
+            }
+            let _ = PostMessageW(Some(self.hwnd), WM_KYNX_FRAME, WPARAM(0), LPARAM(0));
+        }
+        Ok(())
+    }
+
+    /// Zero-copy present when pixels are already Arc-backed.
+    pub fn present_arc(&self, width: u32, height: u32, pixels: Arc<[u8]>) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let expected = (width * height * 4) as usize;
+        if pixels.len() < expected {
+            return Err(anyhow!("frame buffer too small"));
+        }
+        *self.state.frame.lock() = Some(FrameBuffer {
+            width,
+            height,
+            pixels,
+        });
+        let packed_size = ((width as u64) << 32) | (height as u64);
+        let prev = self.last_size.swap(packed_size, Ordering::Relaxed);
+        unsafe {
+            if prev != packed_size {
+                let packed =
+                    ((width.min(0xFFFF) as isize) << 16) | (height.min(0xFFFF) as isize);
+                let _ = PostMessageW(Some(self.hwnd), WM_KYNX_RESIZE, WPARAM(0), LPARAM(packed));
+            }
             let _ = PostMessageW(Some(self.hwnd), WM_KYNX_FRAME, WPARAM(0), LPARAM(0));
         }
         Ok(())
@@ -168,6 +219,7 @@ unsafe fn create_window(
 
     let state = Arc::new(WindowState {
         frame: Mutex::new(None),
+        dib: Mutex::new(None),
     });
 
     let hwnd = CreateWindowExW(
@@ -210,7 +262,9 @@ unsafe fn create_window(
 unsafe fn message_loop(hwnd: HWND, running: Arc<AtomicBool>) {
     let mut msg = MSG::default();
     while running.load(Ordering::SeqCst) {
+        let mut had_msg = false;
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            had_msg = true;
             if msg.message == WM_QUIT {
                 running.store(false, Ordering::SeqCst);
                 break;
@@ -218,7 +272,9 @@ unsafe fn message_loop(hwnd: HWND, running: Arc<AtomicBool>) {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        if !had_msg {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
     let _ = DestroyWindow(hwnd);
 }
@@ -233,7 +289,11 @@ unsafe extern "system" fn wnd_proc(
         WM_DESTROY => {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if ptr != 0 {
-                drop(Box::from_raw(ptr as *mut Arc<WindowState>));
+                let state = Box::from_raw(ptr as *mut Arc<WindowState>);
+                if let Some(dib) = state.dib.lock().take() {
+                    free_dib(dib);
+                }
+                drop(state);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
             LRESULT(0)
@@ -283,12 +343,69 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+unsafe fn free_dib(dib: CachedDib) {
+    let _ = DeleteObject(dib.hbmp.into());
+    let _ = DeleteDC(dib.hdc_mem);
+}
+
+unsafe fn ensure_dib(state: &WindowState, hdc: HDC, width: u32, height: u32) -> Option<*mut u8> {
+    {
+        let dib = state.dib.lock();
+        if let Some(d) = dib.as_ref() {
+            if d.width == width && d.height == height && !d.bits.is_null() {
+                return Some(d.bits);
+            }
+        }
+    }
+
+    if let Some(old) = state.dib.lock().take() {
+        free_dib(old);
+    }
+
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let hdc_mem = CreateCompatibleDC(Some(hdc));
+    let hbmp_result = CreateDIBSection(Some(hdc_mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
+    let Ok(hbmp) = hbmp_result else {
+        let _ = DeleteDC(hdc_mem);
+        return None;
+    };
+    if bits.is_null() {
+        let _ = DeleteObject(hbmp.into());
+        let _ = DeleteDC(hdc_mem);
+        return None;
+    }
+
+    let ptr = bits as *mut u8;
+    *state.dib.lock() = Some(CachedDib {
+        width,
+        height,
+        hdc_mem,
+        hbmp,
+        bits: ptr,
+    });
+    Some(ptr)
+}
+
 unsafe fn paint_frame(hwnd: HWND) {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if ptr == 0 {
         return;
     }
     let state = &*(ptr as *const Arc<WindowState>);
+    // Cheap Arc clone — no pixel copy
     let frame = state.frame.lock().clone();
 
     let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
@@ -309,49 +426,40 @@ unsafe fn paint_frame(hwnd: HWND) {
     let cw = (client.right - client.left).max(1);
     let ch = (client.bottom - client.top).max(1);
 
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: frame.width as i32,
-            biHeight: -(frame.height as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
+    let Some(bits) = ensure_dib(state, hdc, frame.width, frame.height) else {
+        let _ = EndPaint(hwnd, &ps);
+        return;
     };
 
-    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-    let hdc_mem = CreateCompatibleDC(Some(hdc));
-    let hbmp_result = CreateDIBSection(Some(hdc_mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
+    let size = (frame.width * frame.height * 4) as usize;
+    std::ptr::copy_nonoverlapping(
+        frame.pixels.as_ptr(),
+        bits,
+        size.min(frame.pixels.len()),
+    );
 
-    if let Ok(hbmp) = hbmp_result {
-        if !bits.is_null() {
-            let size = (frame.width * frame.height * 4) as usize;
-            std::ptr::copy_nonoverlapping(
-                frame.pixels.as_ptr(),
-                bits as *mut u8,
-                size.min(frame.pixels.len()),
-            );
-            let old = SelectObject(hdc_mem, hbmp.into());
-            let _ = StretchBlt(
-                hdc,
-                0,
-                0,
-                cw,
-                ch,
-                Some(hdc_mem),
-                0,
-                0,
-                frame.width as i32,
-                frame.height as i32,
-                SRCCOPY,
-            );
-            let _ = SelectObject(hdc_mem, old);
-        }
-        let _ = DeleteObject(hbmp.into());
-    }
-    let _ = DeleteDC(hdc_mem);
+    let dib_guard = state.dib.lock();
+    let Some(dib) = dib_guard.as_ref() else {
+        drop(dib_guard);
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    };
+
+    let old = SelectObject(dib.hdc_mem, dib.hbmp.into());
+    let _ = StretchBlt(
+        hdc,
+        0,
+        0,
+        cw,
+        ch,
+        Some(dib.hdc_mem),
+        0,
+        0,
+        frame.width as i32,
+        frame.height as i32,
+        SRCCOPY,
+    );
+    let _ = SelectObject(dib.hdc_mem, old);
+    drop(dib_guard);
     let _ = EndPaint(hwnd, &ps);
 }

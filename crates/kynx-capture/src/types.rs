@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,7 +14,8 @@ pub struct CapturedFrame {
     pub height: u32,
     pub stride: u32,
     pub format: FramePixelFormat,
-    pub pixels: Vec<u8>,
+    /// Shared pixel buffer — cheap to clone across threads.
+    pub pixels: Arc<[u8]>,
     pub timestamp_ms: u64,
 }
 

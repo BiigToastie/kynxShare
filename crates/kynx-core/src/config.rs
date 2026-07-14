@@ -45,7 +45,7 @@ impl Default for AppConfig {
             outputs: OutputChannels::default(),
             share_window: ShareWindowConfig::default(),
             virtual_camera: VirtualCameraConfig::default(),
-            target_fps: 30,
+            target_fps: 60,
             start_with_windows: false,
             onboarding_done: false,
             selected_monitor_ids: Vec::new(),

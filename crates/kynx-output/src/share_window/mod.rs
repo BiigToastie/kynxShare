@@ -33,6 +33,15 @@ impl ShareWindow {
     pub fn present(&self, _width: u32, _height: u32, _bgra: &[u8]) -> anyhow::Result<()> {
         Ok(())
     }
+    pub fn present_arc(
+        &self,
+        _width: u32,
+        _height: u32,
+        _pixels: std::sync::Arc<[u8]>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     pub fn set_visible(&self, _visible: bool) {}
+    pub fn show_for_capture(&self) {}
     pub fn close(&self) {}
 }
