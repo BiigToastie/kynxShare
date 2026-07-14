@@ -60,17 +60,29 @@ impl LayoutConfig {
     }
 
     pub fn resolve_canvas_size(&self, monitors: &[MonitorInfo]) -> (u32, u32) {
-        let (mut w, mut h) = match (self.canvas_width, self.canvas_height) {
-            (Some(w), Some(h)) => (w, h),
+        let (native_w, native_h) = match (self.canvas_width, self.canvas_height) {
+            (Some(w), Some(h)) => (w.max(1), h.max(1)),
             _ => compute_native_canvas_size(&self.placements, monitors),
         };
-        if self.max_width > 0 {
-            w = w.min(self.max_width);
-        }
-        if self.max_height > 0 {
-            h = h.min(self.max_height);
-        }
-        (w.max(1), h.max(1))
+
+        let max_w = if self.max_width == 0 {
+            u32::MAX
+        } else {
+            self.max_width
+        };
+        let max_h = if self.max_height == 0 {
+            u32::MAX
+        } else {
+            self.max_height
+        };
+
+        // Uniform fit into max box — never squash aspect ratio
+        let scale_w = max_w as f64 / native_w as f64;
+        let scale_h = max_h as f64 / native_h as f64;
+        let scale = scale_w.min(scale_h).min(1.0);
+        let w = ((native_w as f64) * scale).round().max(1.0) as u32;
+        let h = ((native_h as f64) * scale).round().max(1.0) as u32;
+        (w, h)
     }
 }
 
