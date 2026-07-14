@@ -260,26 +260,36 @@ impl KynxEngine {
         Ok(())
     }
 
-    /// Start streaming (share window / vcam). Also starts preview if needed.
+    /// Start streaming (share window). Also starts preview if needed.
+    /// Discord needs a *visible* normal window under Fenster / Anwendungen.
     pub fn start(&self) -> Result<()> {
         self.ensure_preview()?;
-        let cfg = self.config.lock().clone();
+        let mut cfg = self.config.lock().clone();
+        cfg.outputs.share_window = true;
+        // Discord does not list SW_HIDE windows — force visible for capture
+        cfg.outputs.show_share_window = true;
+        *self.config.lock() = cfg.clone();
 
-        if cfg.outputs.share_window && self.share.lock().is_none() {
+        if self.share.lock().is_none() {
             let mut sw_cfg = cfg.share_window.clone();
+            sw_cfg.title = "kynxShare Output".into();
+            sw_cfg.visible = true;
             sw_cfg.always_on_top = cfg.outputs.always_on_top;
-            sw_cfg.visible = cfg.outputs.show_share_window;
             match ShareWindow::create(sw_cfg) {
                 Ok(w) => *self.share.lock() = Some(w),
                 Err(e) => warn!("share window failed: {e}"),
             }
         }
 
+        if let Some(w) = self.share.lock().as_ref() {
+            w.show_for_capture();
+        }
+
         self.output_active.store(true, Ordering::SeqCst);
         if let Some(vcam) = self.vcam.lock().as_ref() {
             vcam.set_enabled(cfg.outputs.virtual_camera);
         }
-        info!("kynxShare streaming active");
+        info!("kynxShare streaming active — pick window 'kynxShare Output' in Discord");
         Ok(())
     }
 
@@ -419,7 +429,24 @@ impl KynxEngine {
 
     pub fn set_output_active(&self, active: bool) {
         self.output_active.store(active, Ordering::SeqCst);
-        // Do NOT auto-show share window — visibility is controlled separately
+        if active {
+            // Ensure Discord-visible share window exists
+            let cfg = self.config.lock().clone();
+            if self.share.lock().is_none() {
+                let mut sw_cfg = cfg.share_window.clone();
+                sw_cfg.title = "kynxShare Output".into();
+                sw_cfg.visible = true;
+                if let Ok(w) = ShareWindow::create(sw_cfg) {
+                    *self.share.lock() = Some(w);
+                }
+            }
+            if let Some(share) = self.share.lock().as_ref() {
+                share.show_for_capture();
+            }
+            let mut cfg = self.config.lock().clone();
+            cfg.outputs.show_share_window = true;
+            *self.config.lock() = cfg;
+        }
         if let Some(vcam) = self.vcam.lock().as_ref() {
             let enabled = active && self.config.lock().outputs.virtual_camera;
             vcam.set_enabled(enabled);

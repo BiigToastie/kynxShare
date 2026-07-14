@@ -1,34 +1,28 @@
 # Discord setup
 
-## Recommended: Share window
+## Wichtig: Fenster, nicht Bildschirm
 
-1. Start **kynxShare** and click **Start** (or finish the welcome wizard).
-2. Confirm the status pill shows **Output live**.
-3. A window named **kynxShare Output** appears with your composite.
-4. In Discord: **Share Your Screen** → **Application / Window** → select **kynxShare Output**.
-5. Arrange monitors in the kynxShare preview; the shared window updates live.
+Discord zeigt unter **Bildschirm** nur echte Monitore. kynxShare erscheint dort **nicht**,
+außer du installierst optional einen Virtual Display Driver.
 
-Tips:
+Stattdessen:
 
-- Use **Static layout** to show all enabled monitors at once.
-- Use **Mouse follow** for a fixed viewport (e.g. 1920×1080) that tracks the cursor across monitors.
-- Lower **Max width/height** if Discord struggles with ultra-wide canvases.
+1. In kynxShare auf **Stream starten** klicken  
+   → Fenster **„kynxShare Output“** öffnet sich (muss sichtbar sein).
+2. In Discord: **Bildschirm teilen**
+3. Tab **Fenster** / **Anwendungen** (engl. *Window* / *Application*)
+4. **kynxShare Output** auswählen
 
-## Optional: Virtual Display Driver (true “Screen” source)
+Nicht unter „Bildschirm“ / „Screen“ suchen.
 
-Install the signed open-source driver:
+## Tipps
 
-- GitHub: https://github.com/VirtualDrivers/Virtual-Display-Driver  
-- Winget: `winget install --id=VirtualDrivers.Virtual-Display-Driver -e`
+- Fenster darf im Hintergrund liegen, aber **nicht versteckt** (Toggle „Fenster zeigen“).
+- Wenn es fehlt: Stream stoppen/starten, Fenster kurz in den Vordergrund holen, Discord-Picker neu öffnen.
+- Optional Virtual Display (echter Monitor in Discord):  
+  https://github.com/VirtualDrivers/Virtual-Display-Driver
 
-Then:
+## Kamera-Tab
 
-1. Set the virtual display resolution to match your kynxShare canvas (or follow viewport).
-2. In Discord choose **Screen** and pick the virtual monitor.
-3. Present / fullscreen the **kynxShare Output** window onto that virtual display (Windows display settings → rearrange / set as extended display, then move the output window there and maximize).
-
-kynxShare detects common VDD adapter names and shows status in the Channels panel.
-
-## Optional: Virtual camera
-
-Enable **Virtual camera** in Channels. Frames are published to shared memory for a companion DirectShow/MF filter (see [virtual-camera.md](virtual-camera.md)). Until a filter is installed, prefer the share-window path for Discord.
+Der Virtual-Camera-Bridge ist noch kein Windows-Webcam-Treiber. Für Discord nutze
+**Fenster → kynxShare Output**.

@@ -629,7 +629,9 @@ export default function App() {
               </button>
             </div>
             <p className="hint">
-              Änderungen wirken live. Mit <strong>Speichern</strong> dauerhaft behalten.
+              <strong>Discord:</strong> Bildschirm teilen → Tab <em>Fenster</em> (nicht
+              Bildschirm) → <em>kynxShare Output</em> wählen. Beim Stream-Start öffnet sich
+              dieses Fenster automatisch.
             </p>
           </div>
         </aside>

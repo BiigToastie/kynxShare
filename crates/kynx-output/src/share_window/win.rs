@@ -7,21 +7,22 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject,
-    EndPaint, FillRect, SelectObject, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, SRCCOPY,
+    EndPaint, FillRect, InvalidateRect, SelectObject, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetWindowLongPtrW, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-    IDC_ARROW, MSG, PM_REMOVE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WM_DESTROY,
-    WM_ERASEBKGND, WM_PAINT, WM_QUIT, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, HWND_TOPMOST,
+    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
+    MSG, PM_REMOVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
+    WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_QUIT, WM_USER, WNDCLASSW, WS_EX_APPWINDOW,
+    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, HWND_TOPMOST,
 };
 
 const WM_KYNX_FRAME: u32 = WM_USER + 42;
 const WM_KYNX_VISIBILITY: u32 = WM_USER + 43;
+const WM_KYNX_RESIZE: u32 = WM_USER + 44;
 
 #[derive(Clone)]
 struct FrameBuffer {
@@ -94,6 +95,9 @@ impl ShareWindow {
             pixels: bgra[..expected].to_vec(),
         });
         unsafe {
+            // Pack width/height into LPARAM for optional resize hint
+            let packed = ((width.min(0xFFFF) as isize) << 16) | (height.min(0xFFFF) as isize);
+            let _ = PostMessageW(Some(self.hwnd), WM_KYNX_RESIZE, WPARAM(0), LPARAM(packed));
             let _ = PostMessageW(Some(self.hwnd), WM_KYNX_FRAME, WPARAM(0), LPARAM(0));
         }
         Ok(())
@@ -108,6 +112,11 @@ impl ShareWindow {
                 LPARAM(0),
             );
         }
+    }
+
+    /// Show window so Discord / OBS can pick it as a Window source.
+    pub fn show_for_capture(&self) {
+        self.set_visible(true);
     }
 
     pub fn close(&self) {
@@ -151,7 +160,8 @@ unsafe fn create_window(
     let _ = RegisterClassW(&wc);
 
     let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_APPWINDOW;
+    // Normal app window — Discord/OBS enumerate these. Avoid TOOLWINDOW (hidden from pickers).
+    let mut ex = WS_EX_APPWINDOW;
     if always_on_top {
         ex |= WS_EX_TOPMOST;
     }
@@ -165,8 +175,8 @@ unsafe fn create_window(
         class_name,
         PCWSTR(title_wide.as_ptr()),
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
+        80,
+        80,
         1280,
         720,
         None,
@@ -190,8 +200,10 @@ unsafe fn create_window(
         );
     }
 
-    // Always start hidden unless explicitly requested — avoids white flash on launch
     let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+    if visible {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
     Ok((hwnd.0 as isize, state))
 }
 
@@ -227,7 +239,39 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_KYNX_VISIBILITY => {
-            let _ = ShowWindow(hwnd, if wparam.0 != 0 { SW_SHOW } else { SW_HIDE });
+            let show = wparam.0 != 0;
+            let _ = ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE });
+            if show {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                );
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_KYNX_RESIZE => {
+            let w = ((lparam.0 >> 16) & 0xFFFF) as i32;
+            let h = (lparam.0 & 0xFFFF) as i32;
+            if w > 16 && h > 16 {
+                // Outer window size ≈ client + chrome
+                let ow = (w + 16).clamp(320, 3840);
+                let oh = (h + 40).clamp(240, 2160);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    ow,
+                    oh,
+                    SWP_NOMOVE | SWP_NOZORDER,
+                );
+            }
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -251,7 +295,6 @@ unsafe fn paint_frame(hwnd: HWND) {
     let hdc = BeginPaint(hwnd, &mut ps);
 
     let Some(frame) = frame else {
-        // Fill dark so the window never flashes white
         let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00121214));
         let mut client = RECT::default();
         let _ = GetClientRect(hwnd, &mut client);
