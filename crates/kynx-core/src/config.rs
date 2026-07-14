@@ -13,7 +13,7 @@ pub struct OutputChannels {
     /// Show the Discord capture window on screen (off by default — stays hidden but capturable when shown)
     #[serde(default)]
     pub show_share_window: bool,
-    /// Plug a Parsec virtual monitor so Discord lists it under Bildschirm/Screen.
+    /// Plug a Parsec virtual monitor — **forced off**: auto-plug caused system crashes.
     #[serde(default)]
     pub virtual_display: bool,
     /// Encode JPEG previews for the UI. Disable while streaming to save CPU.
@@ -32,7 +32,8 @@ impl Default for OutputChannels {
             virtual_camera: false,
             always_on_top: false,
             show_share_window: false,
-            virtual_display: true,
+            // NEVER default-on — VDD auto-plug is disabled for stability.
+            virtual_display: false,
             ui_live_preview: true,
         }
     }
@@ -86,7 +87,12 @@ impl AppConfig {
             return Ok(cfg);
         }
         let data = fs::read_to_string(&path)?;
-        let cfg: Self = serde_json::from_str(&data)?;
+        let mut cfg: Self = serde_json::from_str(&data)?;
+        // SAFETY migration: never keep auto-VDD enabled from older builds.
+        if cfg.outputs.virtual_display {
+            cfg.outputs.virtual_display = false;
+            let _ = cfg.save();
+        }
         Ok(cfg)
     }
 

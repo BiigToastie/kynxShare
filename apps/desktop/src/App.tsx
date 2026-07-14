@@ -17,7 +17,7 @@ function normalizeConfig(c: AppConfig): AppConfig {
     outputs: {
       ...c.outputs,
       show_share_window: c.outputs.show_share_window ?? false,
-      virtual_display: c.outputs.virtual_display ?? true,
+      virtual_display: false,
       ui_live_preview: c.outputs.ui_live_preview ?? true,
     },
     layout: {
@@ -645,19 +645,8 @@ export default function App() {
             </div>
             <div className="row">
               <label>Virtueller Bildschirm</label>
-              <button
-                className={config.outputs.virtual_display ? "active" : "ghost"}
-                onClick={() =>
-                  applyLive({
-                    ...config,
-                    outputs: {
-                      ...config.outputs,
-                      virtual_display: !config.outputs.virtual_display,
-                    },
-                  })
-                }
-              >
-                {config.outputs.virtual_display ? "An" : "Aus"}
+              <button className="ghost" disabled title="Deaktiviert — Absturzschutz">
+                Aus (gesperrt)
               </button>
             </div>
             <div className="row">
@@ -678,30 +667,11 @@ export default function App() {
                 {config.outputs.show_share_window ? "Sichtbar" : "Versteckt"}
               </button>
             </div>
-            <div className="stack" style={{ marginTop: "0.45rem" }}>
-              <p className="hint" style={{ margin: 0 }}>
-                VDD:{" "}
-                {snap.vdd.driver_ok || snap.vdd.installed ? (
-                  <strong style={{ color: "var(--ok, #6dcc8d)" }}>Treiber bereit</strong>
-                ) : (
-                  <strong style={{ color: "var(--warn, #e0a35c)" }}>nicht installiert</strong>
-                )}
-                {snap.vdd.active_index != null
-                  ? ` · aktiv #${snap.vdd.active_index}`
-                  : ""}
-              </p>
-              {!snap.vdd.driver_ok ? (
-                <button className="ghost" onClick={() => invoke("open_vdd_installer")}>
-                  Parsec-VDD Installer öffnen
-                </button>
-              ) : null}
-            </div>
             <p className="hint">
-              <strong>Discord Bildschirm:</strong> Virtueller Bildschirm an → Stream starten → in
-              Discord Tab <em>Bildschirm</em> den neuen Monitor wählen (Performance-Optionen).
-              Live-Preview wird beim Start ausgeschaltet (weniger CPU).
-              <br />
-              Ohne VDD-Treiber: Discord → <em>Fenster</em> → <em>kynxShare Output</em>.
+              <strong>Discord:</strong> Bildschirm teilen → Tab <em>Fenster</em> →{" "}
+              <em>kynxShare Output</em>. Automatisches Erstellen virtueller Monitore ist
+              deaktiviert (Absturzschutz). Live-Preview kannst du während dem Stream
+              ausschalten.
             </p>
           </div>
         </aside>
@@ -718,8 +688,7 @@ export default function App() {
             <ol>
               <li>Anordnung prüfen / bei Bedarf „Windows-Anordnung“.</li>
               <li>Output-Größe wählen (Native / 1080p / …).</li>
-              <li>Parsec-VDD installieren (für Discord-Bildschirm).</li>
-              <li>Speichern → Stream starten → Discord: neuer Monitor.</li>
+              <li>Speichern → Stream starten → Discord: Fenster → kynxShare Output.</li>
             </ol>
             <div className="wizard-actions">
               <button className="primary" onClick={finishWizard}>

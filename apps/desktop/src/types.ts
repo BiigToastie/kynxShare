@@ -81,6 +81,7 @@ export interface VirtualDisplayStatus {
   driver_ok: boolean;
   active_index: number | null;
   monitor_device: string | null;
+  plug_disabled: boolean;
 }
 
 export interface EngineSnapshot {

@@ -1,31 +1,18 @@
 # Discord setup
 
-## Empfohlen: Virtueller Bildschirm (Tab „Bildschirm“)
+## Sicherer Weg (aktuell)
 
-Damit Discord unter **Bildschirm / Screen** einen Monitor mit **Performance-Optionen**
-zeigt, braucht Windows einen echten (virtuellen) Monitor:
+1. In kynxShare **Stream starten**
+2. Discord → **Bildschirm teilen** → Tab **Fenster / Anwendungen**
+3. **kynxShare Output** wählen
 
-1. Einmalig **Parsec Virtual Display Driver** installieren  
-   (Button in kynxShare: *Parsec-VDD Installer öffnen*, oder  
-   https://builds.parsec.app/vdd/parsec-vdd-0.41.0.0.exe )
-2. In kynxShare **Virtueller Bildschirm = An**
-3. **Stream starten** → kynxShare steckt einen virtuellen Monitor und legt das Output
-   fullscreen darauf
-4. Discord → **Bildschirm teilen** → Tab **Bildschirm** → neuen Monitor wählen  
-   (Performance / Auflösung wie bei normalen Screens)
+Live-Preview kannst du während dem Stream ausschalten (weniger CPU).
 
-Beim Stream-Start wird die UI-Live-Preview automatisch ausgeschaltet (weniger CPU).
-Du kannst sie jederzeit wieder einschalten.
+## Virtueller Bildschirm
 
-## Fallback: Fenster
+Automatisches Erstellen eines virtuellen Monitors ist **deaktiviert**
+(Absturzschutz nach Display-Reset-Loops). kynxShare steckt keinen Monitor mehr
+via Treiber-IOCTL / ChangeDisplaySettings.
 
-Wenn der Treiber fehlt:
-
-1. Stream starten → Fenster **kynxShare Output**
-2. Discord → Tab **Fenster / Anwendungen** → **kynxShare Output**
-
-## Tipps
-
-- Virtuellen Monitor nie in kynxShare als Capture-Quelle aktivieren (Feedback-Schleife).
-- Live-Preview aus = spürbar mehr FPS für Capture/Compose.
-- Treiber-Docs: https://github.com/nomi-san/parsec-vdd
+Falls Windows noch Geister-Monitore vom vorherigen Versuch zeigt:  
+**Windows-Anzeigeeinstellungen** → nicht vorhandene Displays trennen / PC neu starten.
