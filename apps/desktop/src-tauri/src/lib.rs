@@ -30,18 +30,28 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_snapshot,
             commands::get_config,
+            commands::apply_config,
+            commands::persist_config,
             commands::save_config,
+            commands::ensure_preview,
             commands::start_engine,
             commands::stop_engine,
             commands::set_output_active,
             commands::toggle_mode,
             commands::refresh_monitors,
+            commands::apply_desktop_layout,
             commands::get_preview,
             commands::get_output_preview,
             commands::get_vdd_status,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
+            let engine = app.state::<AppState>().engine.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = engine.ensure_preview() {
+                    tracing::warn!("auto preview failed: {e}");
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {

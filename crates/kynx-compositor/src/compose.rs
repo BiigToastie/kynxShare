@@ -28,12 +28,8 @@ pub fn compose_frame(
     cursor_desktop: Option<(i32, i32)>,
     prev_viewport: Option<(f32, f32)>,
 ) -> ComposeResult {
+    let (layout_w, layout_h) = crate::layout::compute_native_canvas_size(&layout.placements, monitors);
     let (canvas_w, canvas_h) = layout.resolve_canvas_size(monitors);
-    // Auto size from placements without max clamp for editor accuracy when possible
-    let (layout_w, layout_h) = {
-        let (w, h) = crate::layout::compute_native_canvas_size(&layout.placements, monitors);
-        (w.max(canvas_w), h.max(canvas_h))
-    };
 
     let mut canvas = vec![0u8; (layout_w * layout_h * 4) as usize];
     fill_bgra(&mut canvas, layout.background_bgra);

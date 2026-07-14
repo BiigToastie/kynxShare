@@ -70,9 +70,10 @@ impl KynxEngine {
                 .collect();
         }
         cfg.layout.follow.apply_radius();
-        let (cw, ch) = cfg.layout.resolve_canvas_size(&monitors);
+        let (cw, ch) = cfg.layout.native_canvas_size(&monitors);
+        let (ow, oh) = cfg.layout.resolve_canvas_size(&monitors);
         Ok(Self {
-            config: Arc::new(Mutex::new(cfg)),
+            config: Arc::new(Mutex::new(cfg.clone())),
             monitors: Arc::new(Mutex::new(monitors.clone())),
             capture: Arc::new(Mutex::new(None)),
             share: Arc::new(Mutex::new(None)),
@@ -85,12 +86,12 @@ impl KynxEngine {
             latest_status: Arc::new(Mutex::new(EngineStatus {
                 running: false,
                 output_active: false,
-                mode: OutputMode::StaticLayout,
+                mode: cfg.layout.mode,
                 fps: 0.0,
                 canvas_width: cw,
                 canvas_height: ch,
-                output_width: cw,
-                output_height: ch,
+                output_width: ow,
+                output_height: oh,
                 monitor_count: monitors.len(),
             })),
             prev_viewport: Arc::new(Mutex::new(None)),
@@ -101,7 +102,11 @@ impl KynxEngine {
         let monitors = enumerate_monitors()?;
         *self.monitors.lock() = monitors.clone();
         let mut cfg = self.config.lock().clone();
-        sync_layout_with_monitors(&mut cfg.layout, &monitors);
+        if cfg.layout.placements.is_empty() {
+            cfg.layout = LayoutConfig::from_monitors(&monitors);
+        } else {
+            sync_layout_with_monitors(&mut cfg.layout, &monitors);
+        }
         cfg.selected_monitor_ids = cfg
             .layout
             .placements
@@ -109,31 +114,73 @@ impl KynxEngine {
             .filter(|p| p.enabled)
             .map(|p| p.monitor_id.clone())
             .collect();
-        cfg.save()?;
-        *self.config.lock() = cfg;
+        *self.config.lock() = cfg.clone();
+        self.refresh_status_dims(&cfg, &monitors);
         Ok(monitors)
+    }
+
+    pub fn apply_desktop_layout(&self) -> Result<()> {
+        let monitors = self.monitors.lock().clone();
+        let mut cfg = self.config.lock().clone();
+        kynx_compositor::apply_desktop_arrangement(&mut cfg.layout, &monitors);
+        cfg.selected_monitor_ids = monitors.iter().map(|m| m.id.clone()).collect();
+        *self.config.lock() = cfg.clone();
+        self.refresh_status_dims(&cfg, &monitors);
+        Ok(())
     }
 
     pub fn get_config(&self) -> AppConfig {
         self.config.lock().clone()
     }
 
-    pub fn update_config(&self, mut cfg: AppConfig) -> Result<()> {
+    /// Apply config in memory (live preview) without writing disk.
+    pub fn apply_config(&self, mut cfg: AppConfig) -> Result<()> {
         cfg.layout.follow.apply_radius();
         let monitors = self.monitors.lock().clone();
-        let (w, h) = kynx_compositor::compute_native_canvas_size(&cfg.layout.placements, &monitors);
+        let (w, h) = cfg.layout.native_canvas_size(&monitors);
         cfg.layout.canvas_width = Some(w);
         cfg.layout.canvas_height = Some(h);
-        cfg.save()?;
-        // Live-update share window visibility
         if let Some(share) = self.share.lock().as_ref() {
             share.set_visible(cfg.outputs.show_share_window);
         }
         if let Some(vcam) = self.vcam.lock().as_ref() {
-            vcam.set_enabled(cfg.outputs.virtual_camera && self.output_active.load(Ordering::SeqCst));
+            vcam.set_enabled(
+                cfg.outputs.virtual_camera && self.output_active.load(Ordering::SeqCst),
+            );
         }
-        *self.config.lock() = cfg;
+        *self.config.lock() = cfg.clone();
+        self.refresh_status_dims(&cfg, &monitors);
         Ok(())
+    }
+
+    /// Persist current in-memory config to disk.
+    pub fn persist_config(&self) -> Result<()> {
+        self.config.lock().save()
+    }
+
+    /// Apply + persist (legacy).
+    pub fn update_config(&self, cfg: AppConfig) -> Result<()> {
+        self.apply_config(cfg)?;
+        self.persist_config()
+    }
+
+    fn refresh_status_dims(&self, cfg: &AppConfig, monitors: &[MonitorInfo]) {
+        let (cw, ch) = cfg.layout.native_canvas_size(monitors);
+        let (ow, oh) = cfg.layout.resolve_canvas_size(monitors);
+        let mut st = self.latest_status.lock();
+        st.canvas_width = cw;
+        st.canvas_height = ch;
+        // For mouse-follow, output size is follow viewport; approximate until next frame
+        if cfg.layout.mode == OutputMode::MouseFollow {
+            let (fw, fh) = cfg.layout.follow.resolved_size();
+            st.output_width = fw.min(cw).max(1);
+            st.output_height = fh.min(ch).max(1);
+        } else {
+            st.output_width = ow;
+            st.output_height = oh;
+        }
+        st.mode = cfg.layout.mode;
+        st.monitor_count = monitors.len();
     }
 
     pub fn status(&self) -> EngineStatus {
@@ -172,7 +219,8 @@ impl KynxEngine {
         }
     }
 
-    pub fn start(&self) -> Result<()> {
+    /// Start capture + compose for live previews (no stream output required).
+    pub fn ensure_preview(&self) -> Result<()> {
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -197,7 +245,27 @@ impl KynxEngine {
         let capture = MultiCapture::start(selected).context("start capture")?;
         *self.capture.lock() = Some(capture);
 
-        if cfg.outputs.share_window {
+        // Virtual cam mapping ready; disabled until streaming
+        let mut vcam_cfg = cfg.virtual_camera.clone();
+        vcam_cfg.enabled = false;
+        match VirtualCamera::open(vcam_cfg) {
+            Ok(v) => *self.vcam.lock() = Some(v),
+            Err(e) => warn!("virtual camera mapping failed: {e}"),
+        }
+
+        self.running.store(true, Ordering::SeqCst);
+        self.output_active.store(false, Ordering::SeqCst);
+        self.spawn_loop();
+        info!("kynxShare preview running");
+        Ok(())
+    }
+
+    /// Start streaming (share window / vcam). Also starts preview if needed.
+    pub fn start(&self) -> Result<()> {
+        self.ensure_preview()?;
+        let cfg = self.config.lock().clone();
+
+        if cfg.outputs.share_window && self.share.lock().is_none() {
             let mut sw_cfg = cfg.share_window.clone();
             sw_cfg.always_on_top = cfg.outputs.always_on_top;
             sw_cfg.visible = cfg.outputs.show_share_window;
@@ -207,15 +275,18 @@ impl KynxEngine {
             }
         }
 
-        let mut vcam_cfg = cfg.virtual_camera.clone();
-        vcam_cfg.enabled = cfg.outputs.virtual_camera;
-        match VirtualCamera::open(vcam_cfg) {
-            Ok(v) => *self.vcam.lock() = Some(v),
-            Err(e) => warn!("virtual camera mapping failed: {e}"),
-        }
-
-        self.running.store(true, Ordering::SeqCst);
         self.output_active.store(true, Ordering::SeqCst);
+        if let Some(vcam) = self.vcam.lock().as_ref() {
+            vcam.set_enabled(cfg.outputs.virtual_camera);
+        }
+        info!("kynxShare streaming active");
+        Ok(())
+    }
+
+    fn spawn_loop(&self) {
+        if self.loop_handle.lock().is_some() {
+            return;
+        }
 
         let config = Arc::clone(&self.config);
         let monitors_arc = Arc::clone(&self.monitors);
@@ -282,7 +353,7 @@ impl KynxEngine {
                         &composed.layout.pixels,
                         composed.layout.width,
                         composed.layout.height,
-                        1280,
+                        1600,
                     ) {
                         *latest_layout_preview.lock() = Some(jpeg);
                     }
@@ -290,7 +361,7 @@ impl KynxEngine {
                         &composed.output.pixels,
                         composed.output.width,
                         composed.output.height,
-                        640,
+                        1600,
                     ) {
                         *latest_output_preview.lock() = Some(jpeg);
                     }
@@ -319,11 +390,10 @@ impl KynxEngine {
                         std::thread::sleep(frame_budget - elapsed);
                     }
                 }
-            })?;
+            })
+            .expect("spawn engine loop");
 
         *self.loop_handle.lock() = Some(handle);
-        info!("kynxShare engine started");
-        Ok(())
     }
 
     pub fn stop(&self) {
@@ -363,8 +433,9 @@ impl KynxEngine {
             OutputMode::MouseFollow => OutputMode::StaticLayout,
         };
         let mode = cfg.layout.mode;
-        cfg.save()?;
-        *self.config.lock() = cfg;
+        let monitors = self.monitors.lock().clone();
+        *self.config.lock() = cfg.clone();
+        self.refresh_status_dims(&cfg, &monitors);
         Ok(mode)
     }
 }

@@ -6,8 +6,9 @@ mod mouse_follow;
 
 pub use compose::{compose_frame, ComposedFrame, ComposeResult};
 pub use layout::{
-    auto_layout_side_by_side, compute_native_canvas_size, snap_placement, sync_layout_with_monitors,
-    LayoutConfig, MonitorPlacement, OutputMode,
+    apply_desktop_arrangement, auto_layout_side_by_side, compute_native_canvas_size,
+    layout_from_desktop, snap_placement, sync_layout_with_monitors, LayoutConfig, MonitorPlacement,
+    OutputMode,
 };
 pub use mouse_follow::{follow_viewport, MouseFollowConfig, Viewport};
 

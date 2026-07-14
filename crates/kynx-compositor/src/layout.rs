@@ -40,8 +40,8 @@ impl Default for LayoutConfig {
             placements: Vec::new(),
             canvas_width: None,
             canvas_height: None,
-            max_width: 7680,
-            max_height: 4320,
+            max_width: 0,
+            max_height: 0,
             mode: OutputMode::StaticLayout,
             follow: crate::mouse_follow::MouseFollowConfig::default(),
             background_bgra: [18, 18, 20, 255],
@@ -52,7 +52,7 @@ impl Default for LayoutConfig {
 impl LayoutConfig {
     pub fn from_monitors(monitors: &[MonitorInfo]) -> Self {
         let mut cfg = Self::default();
-        cfg.placements = auto_layout_side_by_side(monitors);
+        cfg.placements = layout_from_desktop(monitors);
         let (w, h) = compute_native_canvas_size(&cfg.placements, monitors);
         cfg.canvas_width = Some(w);
         cfg.canvas_height = Some(h);
@@ -60,10 +60,7 @@ impl LayoutConfig {
     }
 
     pub fn resolve_canvas_size(&self, monitors: &[MonitorInfo]) -> (u32, u32) {
-        let (native_w, native_h) = match (self.canvas_width, self.canvas_height) {
-            (Some(w), Some(h)) => (w.max(1), h.max(1)),
-            _ => compute_native_canvas_size(&self.placements, monitors),
-        };
+        let (native_w, native_h) = compute_native_canvas_size(&self.placements, monitors);
 
         let max_w = if self.max_width == 0 {
             u32::MAX
@@ -77,32 +74,44 @@ impl LayoutConfig {
         };
 
         // Uniform fit into max box — never squash aspect ratio
-        let scale_w = max_w as f64 / native_w as f64;
-        let scale_h = max_h as f64 / native_h as f64;
+        let scale_w = max_w as f64 / native_w.max(1) as f64;
+        let scale_h = max_h as f64 / native_h.max(1) as f64;
         let scale = scale_w.min(scale_h).min(1.0);
         let w = ((native_w as f64) * scale).round().max(1.0) as u32;
         let h = ((native_h as f64) * scale).round().max(1.0) as u32;
         (w, h)
     }
+
+    /// Native layout size (no output clamp).
+    pub fn native_canvas_size(&self, monitors: &[MonitorInfo]) -> (u32, u32) {
+        compute_native_canvas_size(&self.placements, monitors)
+    }
 }
 
-/// Place enabled monitors left-to-right by native order (desktop x).
-pub fn auto_layout_side_by_side(monitors: &[MonitorInfo]) -> Vec<MonitorPlacement> {
-    let mut sorted = monitors.to_vec();
-    sorted.sort_by_key(|m| (m.y, m.x));
-    let mut x_cursor = 0i32;
-    let mut placements = Vec::new();
-    for m in sorted {
-        placements.push(MonitorPlacement {
+/// Place monitors exactly like Windows Display Settings (desktop coordinates, no overlap).
+pub fn layout_from_desktop(monitors: &[MonitorInfo]) -> Vec<MonitorPlacement> {
+    if monitors.is_empty() {
+        return Vec::new();
+    }
+    let min_x = monitors.iter().map(|m| m.x).min().unwrap_or(0);
+    let min_y = monitors.iter().map(|m| m.y).min().unwrap_or(0);
+    let mut placements: Vec<MonitorPlacement> = monitors
+        .iter()
+        .map(|m| MonitorPlacement {
             monitor_id: m.id.clone(),
             enabled: true,
-            x: x_cursor,
-            y: 0,
+            x: m.x - min_x,
+            y: m.y - min_y,
             scale: 1.0,
-        });
-        x_cursor += m.width as i32;
-    }
+        })
+        .collect();
+    placements.sort_by_key(|p| (p.y, p.x));
     placements
+}
+
+/// Place enabled monitors left-to-right (legacy fallback).
+pub fn auto_layout_side_by_side(monitors: &[MonitorInfo]) -> Vec<MonitorPlacement> {
+    layout_from_desktop(monitors)
 }
 
 pub fn compute_native_canvas_size(
@@ -132,59 +141,52 @@ pub fn snap_placement(p: &mut MonitorPlacement, grid: i32) {
     p.y = ((p.y as f32 / grid as f32).round() as i32) * grid;
 }
 
-/// Add newly detected monitors and drop removed ones. Recompute auto canvas size.
+/// Add newly detected monitors and drop removed ones.
+/// New monitors are placed using Windows desktop coordinates (relative).
 pub fn sync_layout_with_monitors(layout: &mut LayoutConfig, monitors: &[MonitorInfo]) {
+    if monitors.is_empty() {
+        return;
+    }
+
+    let min_x = monitors.iter().map(|m| m.x).min().unwrap_or(0);
+    let min_y = monitors.iter().map(|m| m.y).min().unwrap_or(0);
+
+    // Remap ids by device name when stable id changed
+    for m in monitors {
+        if let Some(p) = layout.placements.iter_mut().find(|p| {
+            p.monitor_id != m.id && p.monitor_id.contains(&m.device_name)
+        }) {
+            p.monitor_id = m.id.clone();
+        }
+    }
+
     let existing: std::collections::HashSet<String> =
         layout.placements.iter().map(|p| p.monitor_id.clone()).collect();
-
-    let mut x_cursor = layout
-        .placements
-        .iter()
-        .filter(|p| p.enabled)
-        .filter_map(|p| {
-            monitors
-                .iter()
-                .find(|m| m.id == p.monitor_id)
-                .map(|m| p.x + (m.width as f32 * p.scale).round() as i32)
-        })
-        .max()
-        .unwrap_or(0);
 
     for m in monitors {
         if existing.contains(&m.id) {
             continue;
         }
-        // Also try match by device name for id migrations
-        if layout
-            .placements
-            .iter()
-            .any(|p| p.monitor_id.contains(&m.device_name))
-        {
-            // Remap old id → new stable id
-            if let Some(p) = layout
-                .placements
-                .iter_mut()
-                .find(|p| p.monitor_id.contains(&m.device_name) && p.monitor_id != m.id)
-            {
-                p.monitor_id = m.id.clone();
-            }
-            continue;
-        }
         layout.placements.push(MonitorPlacement {
             monitor_id: m.id.clone(),
             enabled: true,
-            x: x_cursor,
-            y: 0,
+            x: m.x - min_x,
+            y: m.y - min_y,
             scale: 1.0,
         });
-        x_cursor += m.width as i32;
     }
 
     let ids: std::collections::HashSet<&str> = monitors.iter().map(|m| m.id.as_str()).collect();
-    layout
-        .placements
-        .retain(|p| ids.contains(p.monitor_id.as_str()) || monitors.iter().any(|m| p.monitor_id.contains(&m.device_name)));
+    layout.placements.retain(|p| ids.contains(p.monitor_id.as_str()));
 
+    let (w, h) = compute_native_canvas_size(&layout.placements, monitors);
+    layout.canvas_width = Some(w);
+    layout.canvas_height = Some(h);
+}
+
+/// Force placements to match current Windows desktop arrangement.
+pub fn apply_desktop_arrangement(layout: &mut LayoutConfig, monitors: &[MonitorInfo]) {
+    layout.placements = layout_from_desktop(monitors);
     let (w, h) = compute_native_canvas_size(&layout.placements, monitors);
     layout.canvas_width = Some(w);
     layout.canvas_height = Some(h);

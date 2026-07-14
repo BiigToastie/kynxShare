@@ -11,15 +11,36 @@ const OUTPUT_PRESETS = [
   { id: "4k", label: "4K", w: 3840, h: 2160 },
 ] as const;
 
+function normalizeConfig(c: AppConfig): AppConfig {
+  return {
+    ...c,
+    outputs: {
+      ...c.outputs,
+      show_share_window: c.outputs.show_share_window ?? false,
+    },
+    layout: {
+      ...c.layout,
+      max_width: c.layout.max_width ?? 0,
+      max_height: c.layout.max_height ?? 0,
+      follow: {
+        ...c.layout.follow,
+        radius: c.layout.follow.radius ?? 960,
+      },
+    },
+  };
+}
+
 export default function App() {
   const [snap, setSnap] = useState<EngineSnapshot | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [savedJson, setSavedJson] = useState<string>("");
   const [layoutPreview, setLayoutPreview] = useState<string | null>(null);
   const [outputPreview, setOutputPreview] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [wizard, setWizard] = useState(false);
   const [fitScale, setFitScale] = useState(0.15);
-  const [zoom, setZoom] = useState(1); // multiplier on fit
+  const [zoom, setZoom] = useState(1);
+  const [saving, setSaving] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{
     id: string;
@@ -32,17 +53,28 @@ export default function App() {
   } | null>(null);
   const configRef = useRef(config);
   configRef.current = config;
+  const applyTimer = useRef<number | null>(null);
 
-  const canvasW = Math.max(
-    1,
-    snap?.status.canvas_width || config?.layout.canvas_width || 1920
-  );
-  const canvasH = Math.max(
-    1,
-    snap?.status.canvas_height || config?.layout.canvas_height || 1080
-  );
-
+  const canvasW = Math.max(1, snap?.status.canvas_width || config?.layout.canvas_width || 1920);
+  const canvasH = Math.max(1, snap?.status.canvas_height || config?.layout.canvas_height || 1080);
   const scale = fitScale * zoom;
+
+  const dirty = useMemo(() => {
+    if (!config || !savedJson) return false;
+    return JSON.stringify(config) !== savedJson;
+  }, [config, savedJson]);
+
+  const applyLive = useCallback(async (next: AppConfig) => {
+    setConfig(next);
+    if (applyTimer.current) window.clearTimeout(applyTimer.current);
+    applyTimer.current = window.setTimeout(async () => {
+      try {
+        await invoke("apply_config", { config: next });
+      } catch (e) {
+        setError(String(e));
+      }
+    }, 80);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -52,21 +84,10 @@ export default function App() {
         invoke<string | null>("get_preview"),
         invoke<string | null>("get_output_preview"),
       ]);
+      const normalized = normalizeConfig(c);
       setSnap(s);
-      setConfig({
-        ...c,
-        outputs: {
-          ...c.outputs,
-          show_share_window: c.outputs.show_share_window ?? false,
-        },
-        layout: {
-          ...c.layout,
-          follow: {
-            ...c.layout.follow,
-            radius: c.layout.follow.radius ?? 960,
-          },
-        },
-      });
+      setConfig(normalized);
+      setSavedJson(JSON.stringify(normalized));
       setLayoutPreview(lp);
       setOutputPreview(op);
       setWizard(!c.onboarding_done);
@@ -77,7 +98,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    refresh();
+    (async () => {
+      try {
+        await invoke("ensure_preview");
+      } catch (e) {
+        setError(String(e));
+      }
+      await refresh();
+    })();
     const id = window.setInterval(async () => {
       try {
         const [s, lp, op] = await Promise.all([
@@ -110,9 +138,18 @@ export default function App() {
     return () => ro.disconnect();
   }, [canvasW, canvasH]);
 
-  const save = async (next: AppConfig) => {
-    setConfig(next);
-    await invoke("save_config", { config: next });
+  const saveToDisk = async () => {
+    if (!config) return;
+    setSaving(true);
+    try {
+      await invoke("save_config", { config });
+      setSavedJson(JSON.stringify(config));
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const onPointerDown = (e: React.PointerEvent, id: string, mode: DragMode) => {
@@ -152,7 +189,6 @@ export default function App() {
         y = Math.round(y / grid) * grid;
         return { ...p, x, y };
       }
-      // Uniform scale from bottom-right — keeps aspect ratio
       const baseW = mon.width;
       const newW = Math.max(240, baseW * drag.origScale + dx);
       const scaleVal = Math.max(0.35, Math.min(2.5, newW / baseW));
@@ -164,8 +200,7 @@ export default function App() {
   const onPointerUp = async () => {
     if (!dragRef.current || !configRef.current) return;
     dragRef.current = null;
-    await save(configRef.current);
-    await refresh();
+    await applyLive(configRef.current);
   };
 
   const toggleMonitor = async (id: string) => {
@@ -173,23 +208,21 @@ export default function App() {
     const placements = config.layout.placements.map((p) =>
       p.monitor_id === id ? { ...p, enabled: !p.enabled } : p
     );
-    await save({
+    await applyLive({
       ...config,
       layout: { ...config.layout, placements },
       selected_monitor_ids: placements.filter((p) => p.enabled).map((p) => p.monitor_id),
     });
-    await refresh();
   };
 
   const setMode = async (mode: OutputMode) => {
     if (!config) return;
-    await save({ ...config, layout: { ...config.layout, mode } });
-    await refresh();
+    await applyLive({ ...config, layout: { ...config.layout, mode } });
   };
 
   const setRadius = async (radius: number) => {
     if (!config) return;
-    const next = {
+    await applyLive({
       ...config,
       layout: {
         ...config.layout,
@@ -200,26 +233,22 @@ export default function App() {
           height: Math.max(180, Math.round((radius * 2 * 9) / 16)),
         },
       },
-    };
-    setConfig(next);
-    await invoke("save_config", { config: next });
+    });
   };
 
   const applyOutputPreset = async (w: number, h: number) => {
     if (!config) return;
-    const next = {
+    await applyLive({
       ...config,
       layout: {
         ...config.layout,
-        max_width: w === 0 ? 16384 : w,
-        max_height: h === 0 ? 16384 : h,
+        max_width: w,
+        max_height: h,
       },
-    };
-    await save(next);
-    await refresh();
+    });
   };
 
-  const setOutputSize = async (field: "max_width" | "max_height", value: number) => {
+  const setOutputSize = (field: "max_width" | "max_height", value: number) => {
     if (!config) return;
     const next = {
       ...config,
@@ -228,15 +257,20 @@ export default function App() {
     setConfig(next);
   };
 
+  const commitOutputSize = async () => {
+    if (!config) return;
+    await applyLive(config);
+  };
+
   const activePreset = useMemo(() => {
     if (!config) return "custom";
     const { max_width: w, max_height: h } = config.layout;
-    if (w >= 16000 && h >= 16000) return "native";
+    if (!w && !h) return "native";
     const hit = OUTPUT_PRESETS.find((p) => p.w === w && p.h === h);
     return hit?.id ?? "custom";
   }, [config]);
 
-  const start = async () => {
+  const startStream = async () => {
     try {
       await invoke("start_engine");
       await refresh();
@@ -245,41 +279,44 @@ export default function App() {
     }
   };
 
-  const stop = async () => {
+  const stopAll = async () => {
     await invoke("stop_engine");
+    try {
+      await invoke("ensure_preview");
+    } catch {
+      /* ignore */
+    }
     await refresh();
   };
 
   const finishWizard = async () => {
     if (!config) return;
-    await save({ ...config, onboarding_done: true });
+    const next = { ...config, onboarding_done: true };
+    await invoke("save_config", { config: next });
     setWizard(false);
-    await start();
+    await invoke("apply_desktop_layout");
+    await invoke("ensure_preview");
+    await refresh();
   };
 
-  const resetLayout = async () => {
-    if (!config || !snap) return;
-    let x = 0;
-    const placements = [...snap.monitors]
-      .sort((a, b) => a.x - b.x || a.y - b.y)
-      .map((m) => {
-        const p = {
-          monitor_id: m.id,
-          enabled: true,
-          x,
-          y: 0,
-          scale: 1,
-        };
-        x += m.width;
-        return p;
-      });
-    await save({
-      ...config,
-      layout: { ...config.layout, placements },
-      selected_monitor_ids: placements.map((p) => p.monitor_id),
-    });
-    setZoom(1);
-    await refresh();
+  const windowsLayout = async () => {
+    try {
+      await invoke("apply_desktop_layout");
+      const [s, c, lp, op] = await Promise.all([
+        invoke<EngineSnapshot>("get_snapshot"),
+        invoke<AppConfig>("get_config"),
+        invoke<string | null>("get_preview"),
+        invoke<string | null>("get_output_preview"),
+      ]);
+      const normalized = normalizeConfig(c);
+      setSnap(s);
+      setConfig(normalized);
+      // savedJson unverändert → Speichern-Button bleibt aktiv
+      setLayoutPreview(lp);
+      setOutputPreview(op);
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   if (!config || !snap) {
@@ -302,30 +339,36 @@ export default function App() {
           <span>Multi-Monitor Stream Output</span>
         </div>
         <div className="top-actions">
+          {dirty ? <span className="badge">Ungespeichert</span> : null}
+          <button
+            className={dirty ? "primary" : "ghost"}
+            disabled={!dirty || saving}
+            onClick={saveToDisk}
+          >
+            {saving ? "Speichern…" : "Speichern"}
+          </button>
           <span className={`status-pill ${snap.status.output_active ? "on" : ""}`}>
             <span className="dot" />
-            {snap.status.running
-              ? snap.status.output_active
-                ? "Live"
-                : "Pausiert"
-              : "Bereit"}
+            {snap.status.output_active
+              ? "Stream live"
+              : snap.status.running
+                ? "Preview"
+                : "Bereit"}
           </span>
-          {!snap.status.running ? (
-            <button className="primary" onClick={start}>
-              Start
+          {!snap.status.output_active ? (
+            <button className="primary" onClick={startStream}>
+              Stream starten
             </button>
           ) : (
             <>
               <button
                 onClick={() =>
-                  invoke("set_output_active", {
-                    active: !snap.status.output_active,
-                  }).then(refresh)
+                  invoke("set_output_active", { active: false }).then(refresh)
                 }
               >
-                {snap.status.output_active ? "Pause" : "Resume"}
+                Stream pausieren
               </button>
-              <button onClick={stop}>Stop</button>
+              <button onClick={stopAll}>Stop</button>
             </>
           )}
         </div>
@@ -333,7 +376,6 @@ export default function App() {
 
       <div className="main">
         <section className="preview-pane">
-          {/* Layout — top half */}
           <div className="stage-block">
             <div className="stage-header">
               <div className="stage-title">
@@ -354,8 +396,8 @@ export default function App() {
                 <button className="chip ghost" onClick={() => setZoom((z) => Math.min(4, z + 0.25))}>
                   +
                 </button>
-                <button className="chip ghost" onClick={resetLayout}>
-                  Reset
+                <button className="chip ghost" onClick={windowsLayout}>
+                  Windows-Anordnung
                 </button>
               </div>
             </div>
@@ -368,10 +410,7 @@ export default function App() {
             >
               <div
                 className="canvas-world"
-                style={{
-                  width: canvasW * scale,
-                  height: canvasH * scale,
-                }}
+                style={{ width: canvasW * scale, height: canvasH * scale }}
               >
                 {layoutPreview ? (
                   <img className="canvas-image" src={layoutPreview} alt="Layout" draggable={false} />
@@ -400,13 +439,12 @@ export default function App() {
                           {mon.name}
                           <small>
                             {Math.round(mon.width * p.scale)}×{Math.round(mon.height * p.scale)}
-                            {p.scale !== 1 ? ` · ${Math.round(p.scale * 100)}%` : ""}
                           </small>
                         </span>
                         <div
                           className="resize-handle"
                           onPointerDown={(e) => onPointerDown(e, p.monitor_id, "resize")}
-                          title="Skalieren (Seitenverhältnis bleibt)"
+                          title="Skalieren"
                         />
                       </div>
                     );
@@ -416,7 +454,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Output — bottom half, same size */}
           <div className="stage-block">
             <div className="stage-header">
               <div className="stage-title">
@@ -437,9 +474,7 @@ export default function App() {
                 {outputPreview ? (
                   <img src={outputPreview} alt="Stream output" draggable={false} />
                 ) : (
-                  <p className="empty-hint">
-                    Starte die Capture-Engine, um den Stream-Output live zu sehen.
-                  </p>
+                  <p className="empty-hint">Preview wird vorbereitet…</p>
                 )}
               </div>
             </div>
@@ -470,7 +505,7 @@ export default function App() {
                 <div className="row">
                   <label>Sichtfeld-Radius</label>
                   <span className="meta" style={{ fontFamily: "var(--mono)", fontSize: "0.75rem", color: "var(--muted)" }}>
-                    {radius * 2}×{Math.round(radius * 2 * 9 / 16)}
+                    {radius * 2}×{Math.round((radius * 2 * 9) / 16)}
                   </span>
                 </div>
                 <input
@@ -481,14 +516,9 @@ export default function App() {
                   value={radius}
                   onChange={(e) => setRadius(Number(e.target.value))}
                 />
-                <p className="hint">
-                  Ausschnitt um den Cursor — live unten im Output sichtbar.
-                </p>
               </div>
             ) : (
-              <p className="hint">
-                Monitore oben anordnen. Unten siehst du exakt den Stream.
-              </p>
+              <p className="hint">Output-Größe unten wählen — Preview aktualisiert sofort.</p>
             )}
           </div>
 
@@ -512,7 +542,7 @@ export default function App() {
                   type="number"
                   value={config.layout.max_width}
                   onChange={(e) => setOutputSize("max_width", Number(e.target.value) || 0)}
-                  onBlur={() => save(config).then(refresh)}
+                  onBlur={commitOutputSize}
                 />
               </label>
               <label>
@@ -521,13 +551,13 @@ export default function App() {
                   type="number"
                   value={config.layout.max_height}
                   onChange={(e) => setOutputSize("max_height", Number(e.target.value) || 0)}
-                  onBlur={() => save(config).then(refresh)}
+                  onBlur={commitOutputSize}
                 />
               </label>
             </div>
             <p className="hint">
-              Native = volle Layout-Auflösung. Presets skalieren proportional in die Box.
-              Aktuell: <strong style={{ color: "var(--text)" }}>{outW}×{outH}</strong>
+              0 = Native (volle Layout-Auflösung). Presets skalieren proportional.
+              Ergebnis: <strong style={{ color: "var(--text)" }}>{outW}×{outH}</strong>
             </p>
           </div>
 
@@ -541,8 +571,7 @@ export default function App() {
                     <div>
                       <strong>{m.name}</strong>
                       <small>
-                        {m.width}×{m.height}
-                        {p ? ` · ${Math.round((p.scale || 1) * 100)}%` : ""}
+                        {m.width}×{m.height} @ ({m.x},{m.y})
                       </small>
                     </div>
                     <button
@@ -555,13 +584,17 @@ export default function App() {
                 );
               })}
             </div>
-            <button
-              className="ghost"
-              style={{ marginTop: "0.55rem", width: "100%" }}
-              onClick={() => invoke("refresh_monitors").then(refresh)}
-            >
-              Displays aktualisieren
-            </button>
+            <div className="stack" style={{ marginTop: "0.55rem" }}>
+              <button className="ghost" onClick={windowsLayout}>
+                Wie Windows anordnen
+              </button>
+              <button
+                className="ghost"
+                onClick={() => invoke("refresh_monitors").then(refresh)}
+              >
+                Displays aktualisieren
+              </button>
+            </div>
           </div>
 
           <div className="panel">
@@ -574,30 +607,29 @@ export default function App() {
                 onChange={(e) =>
                   setConfig({ ...config, target_fps: Number(e.target.value) || 30 })
                 }
-                onBlur={() => save(config)}
+                onBlur={() => config && applyLive(config)}
               />
             </div>
             <div className="row">
-              <label>Share-Fenster</label>
+              <label>Fenster zeigen</label>
               <button
                 className={config.outputs.show_share_window ? "active" : "ghost"}
                 onClick={() =>
-                  save({
+                  applyLive({
                     ...config,
                     outputs: {
                       ...config.outputs,
                       share_window: true,
                       show_share_window: !config.outputs.show_share_window,
                     },
-                  }).then(refresh)
+                  })
                 }
               >
                 {config.outputs.show_share_window ? "Sichtbar" : "Versteckt"}
               </button>
             </div>
             <p className="hint">
-              Für Discord: Fenster kurz sichtbar machen und{" "}
-              <em>kynxShare Output</em> wählen.
+              Änderungen wirken live. Mit <strong>Speichern</strong> dauerhaft behalten.
             </p>
           </div>
         </aside>
@@ -608,12 +640,13 @@ export default function App() {
           <div className="wizard-card">
             <h2>Willkommen bei kynxShare</h2>
             <p className="hint">
-              Oben arrangierst du deine Monitore, unten siehst du den fertigen Stream — gleich groß.
+              Monitore werden wie in den Windows-Anzeigeoptionen angeordnet. Layout &amp; Output
+              siehst du sofort — Speichern hält alles fest.
             </p>
             <ol>
-              <li>Monitore per Drag anordnen, Zoom mit +/− bei Bedarf.</li>
+              <li>Anordnung prüfen / bei Bedarf „Windows-Anordnung“.</li>
               <li>Output-Größe wählen (Native / 1080p / …).</li>
-              <li>Start → in Discord Fenster „kynxShare Output“ teilen.</li>
+              <li>Speichern → Stream starten → Discord: kynxShare Output.</li>
             </ol>
             <div className="wizard-actions">
               <button className="primary" onClick={finishWizard}>
