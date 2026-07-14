@@ -94,6 +94,11 @@ pub fn get_vdd_status(state: State<'_, AppState>) -> VirtualDisplayStatus {
     state.engine.vdd_status()
 }
 
+#[tauri::command]
+pub fn open_vdd_installer(state: State<'_, AppState>) -> Result<(), String> {
+    state.engine.open_vdd_installer().map_err(|e| e.to_string())
+}
+
 fn base64_encode(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();

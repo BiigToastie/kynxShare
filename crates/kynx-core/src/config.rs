@@ -13,6 +13,16 @@ pub struct OutputChannels {
     /// Show the Discord capture window on screen (off by default — stays hidden but capturable when shown)
     #[serde(default)]
     pub show_share_window: bool,
+    /// Plug a Parsec virtual monitor so Discord lists it under Bildschirm/Screen.
+    #[serde(default)]
+    pub virtual_display: bool,
+    /// Encode JPEG previews for the UI. Disable while streaming to save CPU.
+    #[serde(default = "default_true")]
+    pub ui_live_preview: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for OutputChannels {
@@ -22,6 +32,8 @@ impl Default for OutputChannels {
             virtual_camera: false,
             always_on_top: false,
             show_share_window: false,
+            virtual_display: true,
+            ui_live_preview: true,
         }
     }
 }

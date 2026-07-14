@@ -43,6 +43,7 @@ pub fn run() {
             commands::get_preview,
             commands::get_output_preview,
             commands::get_vdd_status,
+            commands::open_vdd_installer,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

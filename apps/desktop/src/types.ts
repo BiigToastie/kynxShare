@@ -47,6 +47,8 @@ export interface OutputChannels {
   virtual_camera: boolean;
   always_on_top: boolean;
   show_share_window: boolean;
+  virtual_display: boolean;
+  ui_live_preview: boolean;
 }
 
 export interface AppConfig {
@@ -76,6 +78,9 @@ export interface VirtualDisplayStatus {
   installed: boolean;
   adapter_name: string | null;
   guidance: string;
+  driver_ok: boolean;
+  active_index: number | null;
+  monitor_device: string | null;
 }
 
 export interface EngineSnapshot {

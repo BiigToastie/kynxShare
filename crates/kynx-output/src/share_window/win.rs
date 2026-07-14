@@ -15,14 +15,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetWindowLongPtrW, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassW, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW,
-    MSG, PM_REMOVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_QUIT, WM_USER, WNDCLASSW, WS_EX_APPWINDOW,
-    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, HWND_TOPMOST,
+    MSG, PM_REMOVE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SW_HIDE, SW_SHOW, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_QUIT, WM_USER, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, HWND_TOPMOST, GWL_STYLE,
+    GWL_EXSTYLE,
 };
 
 const WM_KYNX_FRAME: u32 = WM_USER + 42;
 const WM_KYNX_VISIBILITY: u32 = WM_USER + 43;
 const WM_KYNX_RESIZE: u32 = WM_USER + 44;
+const WM_KYNX_PLACE: u32 = WM_USER + 45;
 
 #[derive(Clone)]
 struct FrameBuffer {
@@ -152,6 +154,22 @@ impl ShareWindow {
             let _ = PostMessageW(Some(self.hwnd), WM_KYNX_FRAME, WPARAM(0), LPARAM(0));
         }
         Ok(())
+    }
+
+    /// Place window borderless fullscreen on a monitor rect (for virtual display / Discord Screen).
+    pub fn place_on_monitor(&self, x: i32, y: i32, width: u32, height: u32) {
+        unsafe {
+            // Pack x,y in lparam (16-bit each) — widths go via wparam high/low
+            let packed_xy =
+                ((x.clamp(-32768, 32767) as i16 as isize) << 16) | (y.clamp(-32768, 32767) as i16 as isize & 0xFFFF);
+            let packed_wh = ((width.min(0xFFFF) as isize) << 16) | (height.min(0xFFFF) as isize);
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_KYNX_PLACE,
+                WPARAM(packed_wh as usize),
+                LPARAM(packed_xy),
+            );
+        }
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -319,9 +337,9 @@ unsafe extern "system" fn wnd_proc(
             let w = ((lparam.0 >> 16) & 0xFFFF) as i32;
             let h = (lparam.0 & 0xFFFF) as i32;
             if w > 16 && h > 16 {
-                // Outer window size ≈ client + chrome
-                let ow = (w + 16).clamp(320, 3840);
-                let oh = (h + 40).clamp(240, 2160);
+                // Outer window size ≈ client + chrome (only when not in borderless place mode)
+                let ow = (w + 16).clamp(320, 7680);
+                let oh = (h + 40).clamp(240, 4320);
                 let _ = SetWindowPos(
                     hwnd,
                     None,
@@ -331,6 +349,33 @@ unsafe extern "system" fn wnd_proc(
                     oh,
                     SWP_NOMOVE | SWP_NOZORDER,
                 );
+            }
+            LRESULT(0)
+        }
+        WM_KYNX_PLACE => {
+            let w = ((wparam.0 >> 16) & 0xFFFF) as i32;
+            let h = (wparam.0 & 0xFFFF) as i32;
+            let x = ((lparam.0 >> 16) as i16) as i32;
+            let y = (lparam.0 as i16) as i32;
+            if w > 16 && h > 16 {
+                // Borderless fullscreen on target monitor — Discord Screen capture sees full desktop.
+                let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP.0 as isize);
+                let _ = SetWindowLongPtrW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    (WS_EX_APPWINDOW | WS_EX_TOPMOST).0 as isize,
+                );
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+                );
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }

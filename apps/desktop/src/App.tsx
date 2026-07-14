@@ -17,6 +17,8 @@ function normalizeConfig(c: AppConfig): AppConfig {
     outputs: {
       ...c.outputs,
       show_share_window: c.outputs.show_share_window ?? false,
+      virtual_display: c.outputs.virtual_display ?? true,
+      ui_live_preview: c.outputs.ui_live_preview ?? true,
     },
     layout: {
       ...c.layout,
@@ -108,18 +110,24 @@ export default function App() {
     })();
     const id = window.setInterval(async () => {
       try {
-        const [s, lp, op] = await Promise.all([
-          invoke<EngineSnapshot>("get_snapshot"),
-          invoke<string | null>("get_preview"),
-          invoke<string | null>("get_output_preview"),
-        ]);
-        setSnap(s);
-        setLayoutPreview(lp);
-        setOutputPreview(op);
+        const previewOn = configRef.current?.outputs.ui_live_preview !== false;
+        if (previewOn) {
+          const [s, lp, op] = await Promise.all([
+            invoke<EngineSnapshot>("get_snapshot"),
+            invoke<string | null>("get_preview"),
+            invoke<string | null>("get_output_preview"),
+          ]);
+          setSnap(s);
+          setLayoutPreview(lp);
+          setOutputPreview(op);
+        } else {
+          const s = await invoke<EngineSnapshot>("get_snapshot");
+          setSnap(s);
+        }
       } catch {
         /* ignore */
       }
-    }, 200);
+    }, configRef.current?.outputs.ui_live_preview === false ? 500 : 250);
     return () => window.clearInterval(id);
   }, [refresh]);
 
@@ -276,6 +284,7 @@ export default function App() {
       await refresh();
     } catch (e) {
       setError(String(e));
+      await refresh();
     }
   };
 
@@ -471,7 +480,14 @@ export default function App() {
             </div>
             <div className="output-stage">
               <div className="output-frame">
-                {outputPreview ? (
+                {config.outputs.ui_live_preview === false ? (
+                  <p className="empty-hint">
+                    Live-Preview aus — mehr Performance für den Stream.
+                    {snap.status.output_active
+                      ? " Discord nutzt den virtuellen Bildschirm / Output-Fenster."
+                      : ""}
+                  </p>
+                ) : outputPreview ? (
                   <img src={outputPreview} alt="Stream output" draggable={false} />
                 ) : (
                   <p className="empty-hint">Preview wird vorbereitet…</p>
@@ -611,6 +627,40 @@ export default function App() {
               />
             </div>
             <div className="row">
+              <label>Live-Preview</label>
+              <button
+                className={config.outputs.ui_live_preview ? "active" : "ghost"}
+                onClick={() =>
+                  applyLive({
+                    ...config,
+                    outputs: {
+                      ...config.outputs,
+                      ui_live_preview: !config.outputs.ui_live_preview,
+                    },
+                  })
+                }
+              >
+                {config.outputs.ui_live_preview ? "An" : "Aus"}
+              </button>
+            </div>
+            <div className="row">
+              <label>Virtueller Bildschirm</label>
+              <button
+                className={config.outputs.virtual_display ? "active" : "ghost"}
+                onClick={() =>
+                  applyLive({
+                    ...config,
+                    outputs: {
+                      ...config.outputs,
+                      virtual_display: !config.outputs.virtual_display,
+                    },
+                  })
+                }
+              >
+                {config.outputs.virtual_display ? "An" : "Aus"}
+              </button>
+            </div>
+            <div className="row">
               <label>Fenster zeigen</label>
               <button
                 className={config.outputs.show_share_window ? "active" : "ghost"}
@@ -628,10 +678,30 @@ export default function App() {
                 {config.outputs.show_share_window ? "Sichtbar" : "Versteckt"}
               </button>
             </div>
+            <div className="stack" style={{ marginTop: "0.45rem" }}>
+              <p className="hint" style={{ margin: 0 }}>
+                VDD:{" "}
+                {snap.vdd.driver_ok || snap.vdd.installed ? (
+                  <strong style={{ color: "var(--ok, #6dcc8d)" }}>Treiber bereit</strong>
+                ) : (
+                  <strong style={{ color: "var(--warn, #e0a35c)" }}>nicht installiert</strong>
+                )}
+                {snap.vdd.active_index != null
+                  ? ` · aktiv #${snap.vdd.active_index}`
+                  : ""}
+              </p>
+              {!snap.vdd.driver_ok ? (
+                <button className="ghost" onClick={() => invoke("open_vdd_installer")}>
+                  Parsec-VDD Installer öffnen
+                </button>
+              ) : null}
+            </div>
             <p className="hint">
-              <strong>Discord:</strong> Bildschirm teilen → Tab <em>Fenster</em> (nicht
-              Bildschirm) → <em>kynxShare Output</em> wählen. Beim Stream-Start öffnet sich
-              dieses Fenster automatisch.
+              <strong>Discord Bildschirm:</strong> Virtueller Bildschirm an → Stream starten → in
+              Discord Tab <em>Bildschirm</em> den neuen Monitor wählen (Performance-Optionen).
+              Live-Preview wird beim Start ausgeschaltet (weniger CPU).
+              <br />
+              Ohne VDD-Treiber: Discord → <em>Fenster</em> → <em>kynxShare Output</em>.
             </p>
           </div>
         </aside>
@@ -648,7 +718,8 @@ export default function App() {
             <ol>
               <li>Anordnung prüfen / bei Bedarf „Windows-Anordnung“.</li>
               <li>Output-Größe wählen (Native / 1080p / …).</li>
-              <li>Speichern → Stream starten → Discord: kynxShare Output.</li>
+              <li>Parsec-VDD installieren (für Discord-Bildschirm).</li>
+              <li>Speichern → Stream starten → Discord: neuer Monitor.</li>
             </ol>
             <div className="wizard-actions">
               <button className="primary" onClick={finishWizard}>

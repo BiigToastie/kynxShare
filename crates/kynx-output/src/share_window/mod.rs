@@ -41,6 +41,7 @@ impl ShareWindow {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    pub fn place_on_monitor(&self, _x: i32, _y: i32, _width: u32, _height: u32) {}
     pub fn set_visible(&self, _visible: bool) {}
     pub fn show_for_capture(&self) {}
     pub fn close(&self) {}

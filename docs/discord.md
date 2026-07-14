@@ -1,28 +1,31 @@
 # Discord setup
 
-## Wichtig: Fenster, nicht Bildschirm
+## Empfohlen: Virtueller Bildschirm (Tab „Bildschirm“)
 
-Discord zeigt unter **Bildschirm** nur echte Monitore. kynxShare erscheint dort **nicht**,
-außer du installierst optional einen Virtual Display Driver.
+Damit Discord unter **Bildschirm / Screen** einen Monitor mit **Performance-Optionen**
+zeigt, braucht Windows einen echten (virtuellen) Monitor:
 
-Stattdessen:
+1. Einmalig **Parsec Virtual Display Driver** installieren  
+   (Button in kynxShare: *Parsec-VDD Installer öffnen*, oder  
+   https://builds.parsec.app/vdd/parsec-vdd-0.41.0.0.exe )
+2. In kynxShare **Virtueller Bildschirm = An**
+3. **Stream starten** → kynxShare steckt einen virtuellen Monitor und legt das Output
+   fullscreen darauf
+4. Discord → **Bildschirm teilen** → Tab **Bildschirm** → neuen Monitor wählen  
+   (Performance / Auflösung wie bei normalen Screens)
 
-1. In kynxShare auf **Stream starten** klicken  
-   → Fenster **„kynxShare Output“** öffnet sich (muss sichtbar sein).
-2. In Discord: **Bildschirm teilen**
-3. Tab **Fenster** / **Anwendungen** (engl. *Window* / *Application*)
-4. **kynxShare Output** auswählen
+Beim Stream-Start wird die UI-Live-Preview automatisch ausgeschaltet (weniger CPU).
+Du kannst sie jederzeit wieder einschalten.
 
-Nicht unter „Bildschirm“ / „Screen“ suchen.
+## Fallback: Fenster
+
+Wenn der Treiber fehlt:
+
+1. Stream starten → Fenster **kynxShare Output**
+2. Discord → Tab **Fenster / Anwendungen** → **kynxShare Output**
 
 ## Tipps
 
-- Fenster darf im Hintergrund liegen, aber **nicht versteckt** (Toggle „Fenster zeigen“).
-- Wenn es fehlt: Stream stoppen/starten, Fenster kurz in den Vordergrund holen, Discord-Picker neu öffnen.
-- Optional Virtual Display (echter Monitor in Discord):  
-  https://github.com/VirtualDrivers/Virtual-Display-Driver
-
-## Kamera-Tab
-
-Der Virtual-Camera-Bridge ist noch kein Windows-Webcam-Treiber. Für Discord nutze
-**Fenster → kynxShare Output**.
+- Virtuellen Monitor nie in kynxShare als Capture-Quelle aktivieren (Feedback-Schleife).
+- Live-Preview aus = spürbar mehr FPS für Capture/Compose.
+- Treiber-Docs: https://github.com/nomi-san/parsec-vdd

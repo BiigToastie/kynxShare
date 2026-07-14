@@ -5,7 +5,8 @@ use kynx_compositor::{
     compose_frame_with_options, sync_layout_with_monitors, ComposeOptions, LayoutConfig, OutputMode,
 };
 use kynx_output::{
-    detect_virtual_display_driver, ShareWindow, VirtualCamera, VirtualDisplayStatus,
+    detect_virtual_display_driver, is_virtual_monitor, open_driver_installer, ShareWindow,
+    VirtualCamera, VirtualDisplaySession, VirtualDisplayStatus,
 };
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -49,6 +50,7 @@ pub struct KynxEngine {
     capture: Arc<Mutex<Option<MultiCapture>>>,
     share: Arc<Mutex<Option<ShareWindow>>>,
     vcam: Arc<Mutex<Option<VirtualCamera>>>,
+    vdd_session: Arc<Mutex<Option<VirtualDisplaySession>>>,
     running: Arc<AtomicBool>,
     output_active: Arc<AtomicBool>,
     loop_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -88,6 +90,7 @@ impl KynxEngine {
             capture: Arc::new(Mutex::new(None)),
             share: Arc::new(Mutex::new(None)),
             vcam: Arc::new(Mutex::new(None)),
+            vdd_session: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             output_active: Arc::new(AtomicBool::new(false)),
             loop_handle: Mutex::new(None),
@@ -116,6 +119,13 @@ impl KynxEngine {
             cfg.layout = LayoutConfig::from_monitors(&monitors);
         } else {
             sync_layout_with_monitors(&mut cfg.layout, &monitors);
+        }
+        for p in &mut cfg.layout.placements {
+            if let Some(m) = monitors.iter().find(|m| m.id == p.monitor_id) {
+                if is_virtual_monitor(&m.name, &m.device_name) {
+                    p.enabled = false;
+                }
+            }
         }
         cfg.selected_monitor_ids = cfg
             .layout
@@ -210,7 +220,18 @@ impl KynxEngine {
     }
 
     pub fn vdd_status(&self) -> VirtualDisplayStatus {
-        detect_virtual_display_driver()
+        let mut st = detect_virtual_display_driver();
+        if let Some(sess) = self.vdd_session.lock().as_ref() {
+            st.active_index = Some(sess.index);
+            st.monitor_device = sess.monitor_device.clone();
+            st.installed = true;
+            st.driver_ok = true;
+        }
+        st
+    }
+
+    pub fn open_vdd_installer(&self) -> Result<()> {
+        open_driver_installer()
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -239,6 +260,7 @@ impl KynxEngine {
         let cfg = self.config.lock().clone();
         let selected: Vec<MonitorInfo> = monitors
             .iter()
+            .filter(|m| !is_virtual_monitor(&m.name, &m.device_name))
             .filter(|m| {
                 cfg.layout
                     .placements
@@ -270,36 +292,112 @@ impl KynxEngine {
         Ok(())
     }
 
-    /// Start streaming (share window). Also starts preview if needed.
-    /// Discord needs a *visible* normal window under Fenster / Anwendungen.
+    /// Start streaming (share window + optional virtual display).
+    /// Discord Screen picker needs a real monitor → Parsec VDD when enabled.
     pub fn start(&self) -> Result<()> {
         self.ensure_preview()?;
         let mut cfg = self.config.lock().clone();
         cfg.outputs.share_window = true;
-        // Discord does not list SW_HIDE windows — force visible for capture
-        cfg.outputs.show_share_window = true;
-        *self.config.lock() = cfg.clone();
+        // Live UI preview costs CPU — off by default while streaming (user can re-enable).
+        cfg.outputs.ui_live_preview = false;
 
-        if self.share.lock().is_none() {
-            let mut sw_cfg = cfg.share_window.clone();
-            sw_cfg.title = "kynxShare Output".into();
-            sw_cfg.visible = true;
-            sw_cfg.always_on_top = cfg.outputs.always_on_top;
-            match ShareWindow::create(sw_cfg) {
-                Ok(w) => *self.share.lock() = Some(w),
-                Err(e) => warn!("share window failed: {e}"),
+        let monitors = self.monitors.lock().clone();
+        let (ow, oh) = if cfg.layout.mode == OutputMode::MouseFollow {
+            let (fw, fh) = cfg.layout.follow.resolved_size();
+            let (cw, ch) = cfg.layout.native_canvas_size(&monitors);
+            (fw.min(cw).max(1), fh.min(ch).max(1))
+        } else {
+            cfg.layout.resolve_canvas_size(&monitors)
+        };
+
+        // Virtual display path (Discord → Bildschirm / Screen + Performance)
+        if cfg.outputs.virtual_display {
+            // Drop previous session if any
+            if let Some(prev) = self.vdd_session.lock().take() {
+                prev.stop();
+            }
+            match VirtualDisplaySession::start(ow, oh, cfg.target_fps.max(60)) {
+                Ok(session) => {
+                    info!(
+                        "virtual display ready index={} device={:?} {}x{} @ {},{}",
+                        session.index,
+                        session.monitor_device,
+                        session.monitor_w,
+                        session.monitor_h,
+                        session.monitor_x,
+                        session.monitor_y
+                    );
+                    cfg.outputs.show_share_window = true;
+                    if self.share.lock().is_none() {
+                        let mut sw_cfg = cfg.share_window.clone();
+                        sw_cfg.title = "kynxShare Output".into();
+                        sw_cfg.visible = true;
+                        sw_cfg.always_on_top = true;
+                        match ShareWindow::create(sw_cfg) {
+                            Ok(w) => *self.share.lock() = Some(w),
+                            Err(e) => warn!("share window failed: {e}"),
+                        }
+                    }
+                    if let Some(w) = self.share.lock().as_ref() {
+                        w.place_on_monitor(
+                            session.monitor_x,
+                            session.monitor_y,
+                            session.monitor_w.max(ow),
+                            session.monitor_h.max(oh),
+                        );
+                        w.show_for_capture();
+                    }
+                    *self.vdd_session.lock() = Some(session);
+                    // Re-enumerate so layout ignores the new virtual monitor
+                    let _ = self.refresh_monitors();
+                }
+                Err(e) => {
+                    warn!("virtual display failed: {e}");
+                    cfg.outputs.show_share_window = true;
+                    if self.share.lock().is_none() {
+                        let mut sw_cfg = cfg.share_window.clone();
+                        sw_cfg.title = "kynxShare Output".into();
+                        sw_cfg.visible = true;
+                        match ShareWindow::create(sw_cfg) {
+                            Ok(w) => *self.share.lock() = Some(w),
+                            Err(e2) => warn!("share window failed: {e2}"),
+                        }
+                    }
+                    if let Some(w) = self.share.lock().as_ref() {
+                        w.show_for_capture();
+                    }
+                    *self.config.lock() = cfg.clone();
+                    self.output_active.store(true, Ordering::SeqCst);
+                    anyhow::bail!(
+                        "Virtueller Bildschirm fehlgeschlagen (Fallback: Fenster-Modus aktiv):\n\n{e}"
+                    );
+                }
+            }
+        } else {
+            // Classic window path
+            cfg.outputs.show_share_window = true;
+            *self.config.lock() = cfg.clone();
+            if self.share.lock().is_none() {
+                let mut sw_cfg = cfg.share_window.clone();
+                sw_cfg.title = "kynxShare Output".into();
+                sw_cfg.visible = true;
+                sw_cfg.always_on_top = cfg.outputs.always_on_top;
+                match ShareWindow::create(sw_cfg) {
+                    Ok(w) => *self.share.lock() = Some(w),
+                    Err(e) => warn!("share window failed: {e}"),
+                }
+            }
+            if let Some(w) = self.share.lock().as_ref() {
+                w.show_for_capture();
             }
         }
 
-        if let Some(w) = self.share.lock().as_ref() {
-            w.show_for_capture();
-        }
-
+        *self.config.lock() = cfg.clone();
         self.output_active.store(true, Ordering::SeqCst);
         if let Some(vcam) = self.vcam.lock().as_ref() {
             vcam.set_enabled(cfg.outputs.virtual_camera);
         }
-        info!("kynxShare streaming active — pick window 'kynxShare Output' in Discord");
+        info!("kynxShare streaming active");
         Ok(())
     }
 
@@ -344,7 +442,8 @@ impl KynxEngine {
                         guard.as_ref().map(|c| c.snapshot()).unwrap_or_default()
                     };
 
-                    let need_layout_preview = last_preview.elapsed() >= PREVIEW_INTERVAL;
+                    let need_layout_preview = cfg.outputs.ui_live_preview
+                        && last_preview.elapsed() >= PREVIEW_INTERVAL;
                     let cursor = get_cursor_pos();
                     let prev = *prev_viewport.lock();
                     let composed = compose_frame_with_options(
@@ -448,6 +547,9 @@ impl KynxEngine {
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
         self.output_active.store(false, Ordering::SeqCst);
+        if let Some(sess) = self.vdd_session.lock().take() {
+            sess.stop();
+        }
         if let Some(h) = self.loop_handle.lock().take() {
             let _ = h.join();
         }
