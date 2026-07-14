@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use anyhow::{Context, Result};
 use kynx_capture::{enumerate_monitors, MonitorInfo, MultiCapture};
-use kynx_compositor::{compose_frame, LayoutConfig, OutputMode};
+use kynx_compositor::{compose_frame, sync_layout_with_monitors, LayoutConfig, OutputMode};
 use kynx_output::{
     detect_virtual_display_driver, ShareWindow, VirtualCamera, VirtualDisplayStatus,
 };
@@ -20,6 +20,8 @@ pub struct EngineStatus {
     pub fps: f32,
     pub canvas_width: u32,
     pub canvas_height: u32,
+    pub output_width: u32,
+    pub output_height: u32,
     pub monitor_count: usize,
 }
 
@@ -29,6 +31,9 @@ pub struct EngineSnapshot {
     pub monitors: Vec<MonitorInfo>,
     pub layout: LayoutConfig,
     pub vdd: VirtualDisplayStatus,
+    pub layout_preview_jpeg_base64: Option<String>,
+    pub output_preview_jpeg_base64: Option<String>,
+    /// @deprecated alias for layout preview
     pub preview_jpeg_base64: Option<String>,
 }
 
@@ -41,7 +46,8 @@ pub struct KynxEngine {
     running: Arc<AtomicBool>,
     output_active: Arc<AtomicBool>,
     loop_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-    latest_preview: Arc<Mutex<Option<Vec<u8>>>>,
+    latest_layout_preview: Arc<Mutex<Option<Vec<u8>>>>,
+    latest_output_preview: Arc<Mutex<Option<Vec<u8>>>>,
     latest_status: Arc<Mutex<EngineStatus>>,
     prev_viewport: Arc<Mutex<Option<(f32, f32)>>>,
 }
@@ -53,7 +59,17 @@ impl KynxEngine {
         if cfg.layout.placements.is_empty() && !monitors.is_empty() {
             cfg.layout = LayoutConfig::from_monitors(&monitors);
             cfg.selected_monitor_ids = monitors.iter().map(|m| m.id.clone()).collect();
+        } else if !monitors.is_empty() {
+            sync_layout_with_monitors(&mut cfg.layout, &monitors);
+            cfg.selected_monitor_ids = cfg
+                .layout
+                .placements
+                .iter()
+                .filter(|p| p.enabled)
+                .map(|p| p.monitor_id.clone())
+                .collect();
         }
+        cfg.layout.follow.apply_radius();
         let (cw, ch) = cfg.layout.resolve_canvas_size(&monitors);
         Ok(Self {
             config: Arc::new(Mutex::new(cfg)),
@@ -64,7 +80,8 @@ impl KynxEngine {
             running: Arc::new(AtomicBool::new(false)),
             output_active: Arc::new(AtomicBool::new(false)),
             loop_handle: Mutex::new(None),
-            latest_preview: Arc::new(Mutex::new(None)),
+            latest_layout_preview: Arc::new(Mutex::new(None)),
+            latest_output_preview: Arc::new(Mutex::new(None)),
             latest_status: Arc::new(Mutex::new(EngineStatus {
                 running: false,
                 output_active: false,
@@ -72,6 +89,8 @@ impl KynxEngine {
                 fps: 0.0,
                 canvas_width: cw,
                 canvas_height: ch,
+                output_width: cw,
+                output_height: ch,
                 monitor_count: monitors.len(),
             })),
             prev_viewport: Arc::new(Mutex::new(None)),
@@ -81,6 +100,17 @@ impl KynxEngine {
     pub fn refresh_monitors(&self) -> Result<Vec<MonitorInfo>> {
         let monitors = enumerate_monitors()?;
         *self.monitors.lock() = monitors.clone();
+        let mut cfg = self.config.lock().clone();
+        sync_layout_with_monitors(&mut cfg.layout, &monitors);
+        cfg.selected_monitor_ids = cfg
+            .layout
+            .placements
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.monitor_id.clone())
+            .collect();
+        cfg.save()?;
+        *self.config.lock() = cfg;
         Ok(monitors)
     }
 
@@ -88,8 +118,20 @@ impl KynxEngine {
         self.config.lock().clone()
     }
 
-    pub fn update_config(&self, cfg: AppConfig) -> Result<()> {
+    pub fn update_config(&self, mut cfg: AppConfig) -> Result<()> {
+        cfg.layout.follow.apply_radius();
+        let monitors = self.monitors.lock().clone();
+        let (w, h) = kynx_compositor::compute_native_canvas_size(&cfg.layout.placements, &monitors);
+        cfg.layout.canvas_width = Some(w);
+        cfg.layout.canvas_height = Some(h);
         cfg.save()?;
+        // Live-update share window visibility
+        if let Some(share) = self.share.lock().as_ref() {
+            share.set_visible(cfg.outputs.show_share_window);
+        }
+        if let Some(vcam) = self.vcam.lock().as_ref() {
+            vcam.set_enabled(cfg.outputs.virtual_camera && self.output_active.load(Ordering::SeqCst));
+        }
         *self.config.lock() = cfg;
         Ok(())
     }
@@ -98,8 +140,16 @@ impl KynxEngine {
         self.latest_status.lock().clone()
     }
 
+    pub fn layout_preview_jpeg(&self) -> Option<Vec<u8>> {
+        self.latest_layout_preview.lock().clone()
+    }
+
+    pub fn output_preview_jpeg(&self) -> Option<Vec<u8>> {
+        self.latest_output_preview.lock().clone()
+    }
+
     pub fn preview_jpeg(&self) -> Option<Vec<u8>> {
-        self.latest_preview.lock().clone()
+        self.layout_preview_jpeg()
     }
 
     pub fn vdd_status(&self) -> VirtualDisplayStatus {
@@ -109,13 +159,16 @@ impl KynxEngine {
     pub fn snapshot(&self) -> EngineSnapshot {
         let cfg = self.config.lock().clone();
         let monitors = self.monitors.lock().clone();
-        let preview = self.preview_jpeg().map(|b| base64_encode(&b));
+        let layout_p = self.layout_preview_jpeg().map(|b| base64_encode(&b));
+        let output_p = self.output_preview_jpeg().map(|b| base64_encode(&b));
         EngineSnapshot {
             status: self.status(),
             monitors,
             layout: cfg.layout,
             vdd: self.vdd_status(),
-            preview_jpeg_base64: preview,
+            layout_preview_jpeg_base64: layout_p.clone(),
+            output_preview_jpeg_base64: output_p,
+            preview_jpeg_base64: layout_p,
         }
     }
 
@@ -123,16 +176,23 @@ impl KynxEngine {
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let _ = self.refresh_monitors();
         let monitors = self.monitors.lock().clone();
         let cfg = self.config.lock().clone();
         let selected: Vec<MonitorInfo> = monitors
             .iter()
             .filter(|m| {
-                cfg.selected_monitor_ids.is_empty()
-                    || cfg.selected_monitor_ids.iter().any(|id| id == &m.id)
+                cfg.layout
+                    .placements
+                    .iter()
+                    .any(|p| p.monitor_id == m.id && p.enabled)
             })
             .cloned()
             .collect();
+
+        if selected.is_empty() {
+            anyhow::bail!("no monitors enabled");
+        }
 
         let capture = MultiCapture::start(selected).context("start capture")?;
         *self.capture.lock() = Some(capture);
@@ -140,7 +200,7 @@ impl KynxEngine {
         if cfg.outputs.share_window {
             let mut sw_cfg = cfg.share_window.clone();
             sw_cfg.always_on_top = cfg.outputs.always_on_top;
-            sw_cfg.visible = true;
+            sw_cfg.visible = cfg.outputs.show_share_window;
             match ShareWindow::create(sw_cfg) {
                 Ok(w) => *self.share.lock() = Some(w),
                 Err(e) => warn!("share window failed: {e}"),
@@ -164,7 +224,8 @@ impl KynxEngine {
         let vcam = Arc::clone(&self.vcam);
         let running = Arc::clone(&self.running);
         let output_active = Arc::clone(&self.output_active);
-        let latest_preview = Arc::clone(&self.latest_preview);
+        let latest_layout_preview = Arc::clone(&self.latest_layout_preview);
+        let latest_output_preview = Arc::clone(&self.latest_output_preview);
         let latest_status = Arc::clone(&self.latest_status);
         let prev_viewport = Arc::clone(&self.prev_viewport);
 
@@ -191,27 +252,47 @@ impl KynxEngine {
                     let prev = *prev_viewport.lock();
                     let composed =
                         compose_frame(&frames_map, &monitors, &cfg.layout, cursor, prev);
-                    if let Some(vp) = composed.viewport {
+                    if let Some(vp) = composed.output.viewport {
                         *prev_viewport.lock() = Some((vp.x, vp.y));
                     }
 
                     if output_active.load(Ordering::SeqCst) {
                         if let Some(w) = share.lock().as_ref() {
-                            let _ = w.present(composed.width, composed.height, &composed.pixels);
+                            let _ = w.present(
+                                composed.output.width,
+                                composed.output.height,
+                                &composed.output.pixels,
+                            );
                         }
                         if let Some(v) = vcam.lock().as_ref() {
                             let ts = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as u64;
-                            v.push_frame(composed.width, composed.height, &composed.pixels, ts);
+                            v.push_frame(
+                                composed.output.width,
+                                composed.output.height,
+                                &composed.output.pixels,
+                                ts,
+                            );
                         }
                     }
 
-                    if let Some(jpeg) =
-                        encode_preview_jpeg(&composed.pixels, composed.width, composed.height, 960)
-                    {
-                        *latest_preview.lock() = Some(jpeg);
+                    if let Some(jpeg) = encode_preview_jpeg(
+                        &composed.layout.pixels,
+                        composed.layout.width,
+                        composed.layout.height,
+                        1280,
+                    ) {
+                        *latest_layout_preview.lock() = Some(jpeg);
+                    }
+                    if let Some(jpeg) = encode_preview_jpeg(
+                        &composed.output.pixels,
+                        composed.output.width,
+                        composed.output.height,
+                        640,
+                    ) {
+                        *latest_output_preview.lock() = Some(jpeg);
                     }
 
                     frames += 1;
@@ -221,22 +302,15 @@ impl KynxEngine {
                         last_fps_t = Instant::now();
                     }
 
-                    let (cw, ch) = cfg.layout.resolve_canvas_size(&monitors);
                     *latest_status.lock() = EngineStatus {
                         running: true,
                         output_active: output_active.load(Ordering::SeqCst),
                         mode: cfg.layout.mode,
                         fps,
-                        canvas_width: if cfg.layout.mode == OutputMode::MouseFollow {
-                            composed.width
-                        } else {
-                            cw
-                        },
-                        canvas_height: if cfg.layout.mode == OutputMode::MouseFollow {
-                            composed.height
-                        } else {
-                            ch
-                        },
+                        canvas_width: composed.layout.width,
+                        canvas_height: composed.layout.height,
+                        output_width: composed.output.width,
+                        output_height: composed.output.height,
                         monitor_count: monitors.len(),
                     };
 
@@ -275,9 +349,7 @@ impl KynxEngine {
 
     pub fn set_output_active(&self, active: bool) {
         self.output_active.store(active, Ordering::SeqCst);
-        if let Some(share) = self.share.lock().as_ref() {
-            share.set_visible(active);
-        }
+        // Do NOT auto-show share window — visibility is controlled separately
         if let Some(vcam) = self.vcam.lock().as_ref() {
             let enabled = active && self.config.lock().outputs.virtual_camera;
             vcam.set_enabled(enabled);

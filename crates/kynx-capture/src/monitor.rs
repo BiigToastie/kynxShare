@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorInfo {
-    /// Stable-ish id: adapter:output index + device name hash
+    /// Stable id from device name + desktop origin
     pub id: String,
     pub name: String,
     pub device_name: String,

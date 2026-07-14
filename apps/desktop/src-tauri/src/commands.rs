@@ -51,7 +51,15 @@ pub fn refresh_monitors(state: State<'_, AppState>) -> Result<Vec<MonitorInfo>, 
 pub fn get_preview(state: State<'_, AppState>) -> Option<String> {
     state
         .engine
-        .preview_jpeg()
+        .layout_preview_jpeg()
+        .map(|b| format!("data:image/jpeg;base64,{}", base64_encode(&b)))
+}
+
+#[tauri::command]
+pub fn get_output_preview(state: State<'_, AppState>) -> Option<String> {
+    state
+        .engine
+        .output_preview_jpeg()
         .map(|b| format!("data:image/jpeg;base64,{}", base64_encode(&b)))
 }
 

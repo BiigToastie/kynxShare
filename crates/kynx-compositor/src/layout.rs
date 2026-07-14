@@ -119,3 +119,61 @@ pub fn snap_placement(p: &mut MonitorPlacement, grid: i32) {
     p.x = ((p.x as f32 / grid as f32).round() as i32) * grid;
     p.y = ((p.y as f32 / grid as f32).round() as i32) * grid;
 }
+
+/// Add newly detected monitors and drop removed ones. Recompute auto canvas size.
+pub fn sync_layout_with_monitors(layout: &mut LayoutConfig, monitors: &[MonitorInfo]) {
+    let existing: std::collections::HashSet<String> =
+        layout.placements.iter().map(|p| p.monitor_id.clone()).collect();
+
+    let mut x_cursor = layout
+        .placements
+        .iter()
+        .filter(|p| p.enabled)
+        .filter_map(|p| {
+            monitors
+                .iter()
+                .find(|m| m.id == p.monitor_id)
+                .map(|m| p.x + (m.width as f32 * p.scale).round() as i32)
+        })
+        .max()
+        .unwrap_or(0);
+
+    for m in monitors {
+        if existing.contains(&m.id) {
+            continue;
+        }
+        // Also try match by device name for id migrations
+        if layout
+            .placements
+            .iter()
+            .any(|p| p.monitor_id.contains(&m.device_name))
+        {
+            // Remap old id → new stable id
+            if let Some(p) = layout
+                .placements
+                .iter_mut()
+                .find(|p| p.monitor_id.contains(&m.device_name) && p.monitor_id != m.id)
+            {
+                p.monitor_id = m.id.clone();
+            }
+            continue;
+        }
+        layout.placements.push(MonitorPlacement {
+            monitor_id: m.id.clone(),
+            enabled: true,
+            x: x_cursor,
+            y: 0,
+            scale: 1.0,
+        });
+        x_cursor += m.width as i32;
+    }
+
+    let ids: std::collections::HashSet<&str> = monitors.iter().map(|m| m.id.as_str()).collect();
+    layout
+        .placements
+        .retain(|p| ids.contains(p.monitor_id.as_str()) || monitors.iter().any(|m| p.monitor_id.contains(&m.device_name)));
+
+    let (w, h) = compute_native_canvas_size(&layout.placements, monitors);
+    layout.canvas_width = Some(w);
+    layout.canvas_height = Some(h);
+}

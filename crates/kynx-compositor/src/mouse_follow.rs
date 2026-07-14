@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MouseFollowConfig {
-    /// Viewport width in output pixels
+    /// Viewport width in output pixels (derived from radius when radius > 0)
     pub width: u32,
     /// Viewport height in output pixels
     pub height: u32,
@@ -10,6 +10,14 @@ pub struct MouseFollowConfig {
     pub edge_padding: u32,
     /// Lerp factor per frame (0..1). Higher = snappier.
     pub smoothing: f32,
+    /// Radius around the cursor in canvas pixels (half of the follow window width).
+    /// When > 0, width/height are derived as 16:9 from this radius.
+    #[serde(default = "default_radius")]
+    pub radius: u32,
+}
+
+fn default_radius() -> u32 {
+    960
 }
 
 impl Default for MouseFollowConfig {
@@ -18,12 +26,37 @@ impl Default for MouseFollowConfig {
             width: 1920,
             height: 1080,
             edge_padding: 120,
-            smoothing: 0.18,
+            smoothing: 0.22,
+            radius: 960,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+impl MouseFollowConfig {
+    /// Apply radius → width/height (16:9), keep padding sensible.
+    pub fn apply_radius(&mut self) {
+        if self.radius == 0 {
+            return;
+        }
+        let w = (self.radius.saturating_mul(2)).max(320);
+        let h = ((w as f32 * 9.0 / 16.0).round() as u32).max(180);
+        self.width = w;
+        self.height = h;
+        self.edge_padding = (self.radius / 8).max(40).min(self.radius / 2);
+    }
+
+    pub fn resolved_size(&self) -> (u32, u32) {
+        if self.radius > 0 {
+            let w = (self.radius.saturating_mul(2)).max(320);
+            let h = ((w as f32 * 9.0 / 16.0).round() as u32).max(180);
+            (w, h)
+        } else {
+            (self.width.max(1), self.height.max(1))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Viewport {
     pub x: f32,
     pub y: f32,
@@ -32,9 +65,6 @@ pub struct Viewport {
 }
 
 /// Smoothly track a viewport around the cursor on the virtual canvas.
-///
-/// `cursor_canvas` is cursor position in canvas coordinates.
-/// `prev` is the previous viewport top-left (for smoothing).
 pub fn follow_viewport(
     cursor_canvas: (f32, f32),
     canvas_w: u32,
@@ -42,15 +72,14 @@ pub fn follow_viewport(
     cfg: &MouseFollowConfig,
     prev: Option<(f32, f32)>,
 ) -> Viewport {
-    let vw = cfg.width.min(canvas_w).max(1);
-    let vh = cfg.height.min(canvas_h).max(1);
-    let pad = cfg.edge_padding as f32;
+    let (rw, rh) = cfg.resolved_size();
+    let vw = rw.min(canvas_w).max(1);
+    let vh = rh.min(canvas_h).max(1);
+    let pad = cfg.edge_padding.min(vw / 3).min(vh / 3) as f32;
 
-    // Ideal top-left so cursor sits in center, then clamp so we stay on canvas
     let ideal_x = cursor_canvas.0 - vw as f32 / 2.0;
     let ideal_y = cursor_canvas.1 - vh as f32 / 2.0;
 
-    // Soft bias: if cursor near edge of ideal viewport, prefer keeping padding
     let mut target_x = ideal_x;
     let mut target_y = ideal_y;
 
@@ -93,7 +122,9 @@ pub fn desktop_cursor_to_canvas(
     monitors: &[kynx_capture::MonitorInfo],
 ) -> Option<(f32, f32)> {
     for p in placements.iter().filter(|p| p.enabled) {
-        let m = monitors.iter().find(|m| m.id == p.monitor_id)?;
+        let Some(m) = monitors.iter().find(|m| m.id == p.monitor_id) else {
+            continue;
+        };
         let right = m.x + m.width as i32;
         let bottom = m.y + m.height as i32;
         if desktop_x >= m.x && desktop_x < right && desktop_y >= m.y && desktop_y < bottom {

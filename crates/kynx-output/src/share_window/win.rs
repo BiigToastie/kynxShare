@@ -6,8 +6,9 @@ use std::sync::Arc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
-    SelectObject, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject,
+    EndPaint, FillRect, SelectObject, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -15,8 +16,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassW, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
     IDC_ARROW, MSG, PM_REMOVE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WM_DESTROY,
-    WM_PAINT, WM_QUIT, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-    HWND_TOPMOST,
+    WM_ERASEBKGND, WM_PAINT, WM_QUIT, WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, HWND_TOPMOST,
 };
 
 const WM_KYNX_FRAME: u32 = WM_USER + 42;
@@ -137,18 +138,20 @@ unsafe fn create_window(
     let class_name = windows::core::w!("KynxShareOutputClass");
     let hinstance = GetModuleHandleW(None)?;
 
+    let black = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00121214));
     let wc = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wnd_proc),
         hInstance: hinstance.into(),
         hCursor: LoadCursorW(None, IDC_ARROW)?,
+        hbrBackground: black,
         lpszClassName: class_name,
         ..Default::default()
     };
     let _ = RegisterClassW(&wc);
 
     let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut ex = WS_EX_APPWINDOW;
+    let mut ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_APPWINDOW;
     if always_on_top {
         ex |= WS_EX_TOPMOST;
     }
@@ -187,6 +190,7 @@ unsafe fn create_window(
         );
     }
 
+    // Always start hidden unless explicitly requested — avoids white flash on launch
     let _ = ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
     Ok((hwnd.0 as isize, state))
 }
@@ -226,6 +230,7 @@ unsafe extern "system" fn wnd_proc(
             let _ = ShowWindow(hwnd, if wparam.0 != 0 { SW_SHOW } else { SW_HIDE });
             LRESULT(0)
         }
+        WM_ERASEBKGND => LRESULT(1),
         WM_KYNX_FRAME | WM_PAINT => {
             paint_frame(hwnd);
             LRESULT(0)
@@ -246,6 +251,12 @@ unsafe fn paint_frame(hwnd: HWND) {
     let hdc = BeginPaint(hwnd, &mut ps);
 
     let Some(frame) = frame else {
+        // Fill dark so the window never flashes white
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00121214));
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let _ = FillRect(hdc, &client, brush);
+        let _ = DeleteObject(brush.into());
         let _ = EndPaint(hwnd, &ps);
         return;
     };

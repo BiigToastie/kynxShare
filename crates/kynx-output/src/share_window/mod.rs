@@ -14,7 +14,7 @@ impl Default for ShareWindowConfig {
         Self {
             title: "kynxShare Output".into(),
             always_on_top: false,
-            visible: true,
+            visible: false,
         }
     }
 }

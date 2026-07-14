@@ -12,16 +12,30 @@ pub struct ComposedFrame {
     pub viewport: Option<Viewport>,
 }
 
-/// Compose monitor frames onto a canvas according to layout / mouse-follow.
+#[derive(Debug, Clone)]
+pub struct ComposeResult {
+    /// Full canvas — for layout editor preview
+    pub layout: ComposedFrame,
+    /// What Discord/stream sees (cropped when mouse-follow)
+    pub output: ComposedFrame,
+}
+
+/// Compose monitor frames onto a canvas; always keep full layout + stream output.
 pub fn compose_frame(
     frames: &HashMap<String, CapturedFrame>,
     monitors: &[MonitorInfo],
     layout: &LayoutConfig,
     cursor_desktop: Option<(i32, i32)>,
     prev_viewport: Option<(f32, f32)>,
-) -> ComposedFrame {
+) -> ComposeResult {
     let (canvas_w, canvas_h) = layout.resolve_canvas_size(monitors);
-    let mut canvas = vec![0u8; (canvas_w * canvas_h * 4) as usize];
+    // Auto size from placements without max clamp for editor accuracy when possible
+    let (layout_w, layout_h) = {
+        let (w, h) = crate::layout::compute_native_canvas_size(&layout.placements, monitors);
+        (w.max(canvas_w), h.max(canvas_h))
+    };
+
+    let mut canvas = vec![0u8; (layout_w * layout_h * 4) as usize];
     fill_bgra(&mut canvas, layout.background_bgra);
 
     for p in layout.placements.iter().filter(|p| p.enabled) {
@@ -35,8 +49,8 @@ pub fn compose_frame(
         let dest_h = ((mon.height as f32) * p.scale).round().max(1.0) as u32;
         blit_scaled(
             &mut canvas,
-            canvas_w,
-            canvas_h,
+            layout_w,
+            layout_h,
             p.x,
             p.y,
             dest_w,
@@ -48,35 +62,67 @@ pub fn compose_frame(
         );
     }
 
+    let layout_frame = ComposedFrame {
+        width: layout_w,
+        height: layout_h,
+        pixels: canvas.clone(),
+        viewport: None,
+    };
+
     if layout.mode == OutputMode::MouseFollow {
         let cursor_canvas = cursor_desktop
-            .and_then(|(x, y)| {
-                desktop_cursor_to_canvas(x, y, &layout.placements, monitors)
-            })
-            .unwrap_or((canvas_w as f32 / 2.0, canvas_h as f32 / 2.0));
+            .and_then(|(x, y)| desktop_cursor_to_canvas(x, y, &layout.placements, monitors))
+            .unwrap_or((layout_w as f32 / 2.0, layout_h as f32 / 2.0));
 
         let vp = follow_viewport(
             cursor_canvas,
-            canvas_w,
-            canvas_h,
+            layout_w,
+            layout_h,
             &layout.follow,
             prev_viewport,
         );
-        let cropped = crop_bgra(&canvas, canvas_w, canvas_h, &vp);
-        return ComposedFrame {
+        let cropped = crop_bgra(&canvas, layout_w, layout_h, &vp);
+        let output = ComposedFrame {
             width: vp.width,
             height: vp.height,
             pixels: cropped,
             viewport: Some(vp),
         };
+        return ComposeResult {
+            layout: layout_frame,
+            output,
+        };
     }
 
-    // Optional downscale if canvas was clamped below native placement bounds
-    ComposedFrame {
-        width: canvas_w,
-        height: canvas_h,
-        pixels: canvas,
-        viewport: None,
+    // Static: optionally downscale to max canvas for output
+    let output = if layout_w != canvas_w || layout_h != canvas_h {
+        let mut scaled = vec![0u8; (canvas_w * canvas_h * 4) as usize];
+        blit_scaled(
+            &mut scaled,
+            canvas_w,
+            canvas_h,
+            0,
+            0,
+            canvas_w,
+            canvas_h,
+            &canvas,
+            layout_w,
+            layout_h,
+            layout_w * 4,
+        );
+        ComposedFrame {
+            width: canvas_w,
+            height: canvas_h,
+            pixels: scaled,
+            viewport: None,
+        }
+    } else {
+        layout_frame.clone()
+    };
+
+    ComposeResult {
+        layout: layout_frame,
+        output,
     }
 }
 

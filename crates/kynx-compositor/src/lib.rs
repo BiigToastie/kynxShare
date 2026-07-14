@@ -4,10 +4,10 @@ mod compose;
 mod layout;
 mod mouse_follow;
 
-pub use compose::{compose_frame, ComposedFrame};
+pub use compose::{compose_frame, ComposedFrame, ComposeResult};
 pub use layout::{
-    auto_layout_side_by_side, compute_native_canvas_size, snap_placement, LayoutConfig,
-    MonitorPlacement, OutputMode,
+    auto_layout_side_by_side, compute_native_canvas_size, snap_placement, sync_layout_with_monitors,
+    LayoutConfig, MonitorPlacement, OutputMode,
 };
 pub use mouse_follow::{follow_viewport, MouseFollowConfig, Viewport};
 
@@ -52,6 +52,7 @@ mod tests {
             height: 1080,
             edge_padding: 100,
             smoothing: 1.0,
+            radius: 960,
         };
         let vp = follow_viewport((50.0, 50.0), 3840, 1080, &cfg, None);
         assert_eq!(vp.width, 1920);

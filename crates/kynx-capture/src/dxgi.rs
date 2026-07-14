@@ -27,77 +27,200 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFOEXW};
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
+#[derive(Clone)]
+struct DxgiMatch {
+    adapter_index: u32,
+    output_index: u32,
+    device_name: String,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn stable_id(device_name: &str, x: i32, y: i32) -> String {
+    format!("{device_name}@{x},{y}")
+}
+
 pub fn enumerate_monitors_dxgi() -> Result<Vec<MonitorInfo>> {
     unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-        let mut monitors = Vec::new();
-        let mut adapter_index = 0u32;
+        let dxgi = collect_dxgi_outputs();
+        let mut monitors = enumerate_via_gdi(&dxgi);
 
-        loop {
-            let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(adapter_index) {
-                Ok(a) => a,
-                Err(_) => break,
-            };
-
-            let mut output_index = 0u32;
-            loop {
-                let output: IDXGIOutput = match adapter.EnumOutputs(output_index) {
-                    Ok(o) => o,
-                    Err(_) => break,
-                };
-
-                let desc = output.GetDesc()?;
-
-                if desc.AttachedToDesktop.as_bool() {
-                    let device_name = wchar_to_string(&desc.DeviceName);
-                    let rect = desc.DesktopCoordinates;
-                    let width = (rect.right - rect.left).max(0) as u32;
-                    let height = (rect.bottom - rect.top).max(0) as u32;
-
-                    let mut is_primary = false;
-                    let refresh_hz = 60u32;
-                    let mut mi = MONITORINFOEXW {
-                        monitorInfo: windows::Win32::Graphics::Gdi::MONITORINFO {
-                            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    if GetMonitorInfoW(desc.Monitor, &mut mi as *mut _ as _).as_bool() {
-                        is_primary = (mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
-                    }
-
-                    let id = format!("{adapter_index}:{output_index}:{device_name}");
-                    let name = if is_primary {
-                        format!("Display {} (Primary)", monitors.len() + 1)
-                    } else {
-                        format!("Display {}", monitors.len() + 1)
-                    };
-
-                    monitors.push(MonitorInfo {
-                        id,
-                        name,
-                        device_name,
-                        adapter_index,
-                        output_index,
-                        x: rect.left,
-                        y: rect.top,
-                        width,
-                        height,
-                        refresh_hz,
-                        is_primary,
-                        scale_percent: 100,
-                    });
-                }
-
-                output_index += 1;
+        if monitors.is_empty() {
+            for (i, d) in dxgi.iter().enumerate() {
+                monitors.push(MonitorInfo {
+                    id: stable_id(&d.device_name, d.x, d.y),
+                    name: format!("Display {}", i + 1),
+                    device_name: d.device_name.clone(),
+                    adapter_index: d.adapter_index,
+                    output_index: d.output_index,
+                    x: d.x,
+                    y: d.y,
+                    width: d.width,
+                    height: d.height,
+                    refresh_hz: 60,
+                    is_primary: i == 0,
+                    scale_percent: 100,
+                });
             }
-            adapter_index += 1;
+        }
+
+        // Merge DXGI-only outputs GDI may have missed (multi-GPU)
+        for d in &dxgi {
+            let exists = monitors.iter().any(|m| {
+                m.device_name.eq_ignore_ascii_case(&d.device_name)
+                    || (m.x == d.x && m.y == d.y && m.width == d.width && m.height == d.height)
+            });
+            if exists {
+                continue;
+            }
+            let idx = monitors.len() + 1;
+            monitors.push(MonitorInfo {
+                id: stable_id(&d.device_name, d.x, d.y),
+                name: format!("Display {idx}"),
+                device_name: d.device_name.clone(),
+                adapter_index: d.adapter_index,
+                output_index: d.output_index,
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: d.height,
+                refresh_hz: 60,
+                is_primary: false,
+                scale_percent: 100,
+            });
         }
 
         monitors.sort_by_key(|m| (m.y, m.x));
+        for (i, m) in monitors.iter_mut().enumerate() {
+            m.name = if m.is_primary {
+                format!("Display {} (Primary)", i + 1)
+            } else {
+                format!("Display {}", i + 1)
+            };
+        }
         Ok(monitors)
     }
+}
+
+unsafe fn collect_dxgi_outputs() -> Vec<DxgiMatch> {
+    let mut out = Vec::new();
+    let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+        return out;
+    };
+    let mut adapter_index = 0u32;
+    loop {
+        let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(adapter_index) {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        let mut output_index = 0u32;
+        loop {
+            let output: IDXGIOutput = match adapter.EnumOutputs(output_index) {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            if let Ok(desc) = output.GetDesc() {
+                if desc.AttachedToDesktop.as_bool() {
+                    let device_name = wchar_to_string(&desc.DeviceName);
+                    let rect = desc.DesktopCoordinates;
+                    out.push(DxgiMatch {
+                        adapter_index,
+                        output_index,
+                        device_name,
+                        x: rect.left,
+                        y: rect.top,
+                        width: (rect.right - rect.left).max(0) as u32,
+                        height: (rect.bottom - rect.top).max(0) as u32,
+                    });
+                }
+            }
+            output_index += 1;
+        }
+        adapter_index += 1;
+    }
+    out
+}
+
+struct EnumCtx {
+    dxgi: Vec<DxgiMatch>,
+    monitors: Vec<MonitorInfo>,
+}
+
+unsafe extern "system" fn monitor_enum_proc(
+    hmonitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    _hdc: windows::Win32::Graphics::Gdi::HDC,
+    _lprc: *mut windows::Win32::Foundation::RECT,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::core::BOOL {
+    let ctx = &mut *(lparam.0 as *mut EnumCtx);
+    let mut mi = MONITORINFOEXW {
+        monitorInfo: windows::Win32::Graphics::Gdi::MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(hmonitor, &mut mi as *mut _ as *mut _).as_bool() {
+        return windows::core::BOOL(1);
+    }
+
+    let device_name = wchar_to_string(&mi.szDevice);
+    let rc = mi.monitorInfo.rcMonitor;
+    let x = rc.left;
+    let y = rc.top;
+    let width = (rc.right - rc.left).max(0) as u32;
+    let height = (rc.bottom - rc.top).max(0) as u32;
+    let is_primary = (mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
+
+    let matched = ctx
+        .dxgi
+        .iter()
+        .find(|d| d.device_name.eq_ignore_ascii_case(&device_name))
+        .or_else(|| {
+            ctx.dxgi
+                .iter()
+                .find(|d| d.x == x && d.y == y && d.width == width && d.height == height)
+        });
+
+    let (adapter_index, output_index) = matched
+        .map(|d| (d.adapter_index, d.output_index))
+        .unwrap_or((0, ctx.monitors.len() as u32));
+
+    ctx.monitors.push(MonitorInfo {
+        id: stable_id(&device_name, x, y),
+        name: String::new(),
+        device_name,
+        adapter_index,
+        output_index,
+        x,
+        y,
+        width,
+        height,
+        refresh_hz: 60,
+        is_primary,
+        scale_percent: 100,
+    });
+
+    windows::core::BOOL(1)
+}
+
+unsafe fn enumerate_via_gdi(dxgi: &[DxgiMatch]) -> Vec<MonitorInfo> {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
+
+    let mut ctx = EnumCtx {
+        dxgi: dxgi.to_vec(),
+        monitors: Vec::new(),
+    };
+    let _ = EnumDisplayMonitors(
+        None,
+        None,
+        Some(monitor_enum_proc),
+        LPARAM(&mut ctx as *mut _ as isize),
+    );
+    ctx.monitors
 }
 
 fn wchar_to_string(buf: &[u16]) -> String {

@@ -1,26 +1,59 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AppConfig, EngineSnapshot, OutputMode } from "./types";
+
+type DragMode = "move" | "resize";
 
 export default function App() {
   const [snap, setSnap] = useState<EngineSnapshot | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
+  const [layoutPreview, setLayoutPreview] = useState<string | null>(null);
+  const [outputPreview, setOutputPreview] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [wizard, setWizard] = useState(false);
+  const [scale, setScale] = useState(0.2);
   const stageRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<{ id: string; ox: number; oy: number } | null>(null);
+  const worldRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{
+    id: string;
+    mode: DragMode;
+    startX: number;
+    startY: number;
+    origX: number;
+    origY: number;
+    origScale: number;
+  } | null>(null);
+  const configRef = useRef(config);
+  configRef.current = config;
+
+  const canvasW = snap?.status.canvas_width || config?.layout.canvas_width || 1920;
+  const canvasH = snap?.status.canvas_height || config?.layout.canvas_height || 1080;
 
   const refresh = useCallback(async () => {
     try {
-      const [s, c, p] = await Promise.all([
+      const [s, c, lp, op] = await Promise.all([
         invoke<EngineSnapshot>("get_snapshot"),
         invoke<AppConfig>("get_config"),
         invoke<string | null>("get_preview"),
+        invoke<string | null>("get_output_preview"),
       ]);
       setSnap(s);
-      setConfig(c);
-      setPreview(p);
+      setConfig({
+        ...c,
+        outputs: {
+          ...c.outputs,
+          show_share_window: c.outputs.show_share_window ?? false,
+        },
+        layout: {
+          ...c.layout,
+          follow: {
+            ...c.layout.follow,
+            radius: c.layout.follow.radius ?? 960,
+          },
+        },
+      });
+      setLayoutPreview(lp);
+      setOutputPreview(op);
       setWizard(!c.onboarding_done);
       setError(null);
     } catch (e) {
@@ -32,70 +65,96 @@ export default function App() {
     refresh();
     const id = window.setInterval(async () => {
       try {
-        const [s, p] = await Promise.all([
+        const [s, lp, op] = await Promise.all([
           invoke<EngineSnapshot>("get_snapshot"),
           invoke<string | null>("get_preview"),
+          invoke<string | null>("get_output_preview"),
         ]);
         setSnap(s);
-        setPreview(p);
+        setLayoutPreview(lp);
+        setOutputPreview(op);
       } catch {
-        /* ignore poll errors */
+        /* ignore */
       }
-    }, 500);
+    }, 200);
     return () => window.clearInterval(id);
   }, [refresh]);
+
+  useLayoutEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const update = () => {
+      const rect = el.getBoundingClientRect();
+      const pad = 24;
+      const s = Math.min(
+        (rect.width - pad) / canvasW,
+        (rect.height - pad) / canvasH,
+        1
+      );
+      setScale(Number.isFinite(s) && s > 0 ? s : 0.2);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [canvasW, canvasH]);
 
   const save = async (next: AppConfig) => {
     setConfig(next);
     await invoke("save_config", { config: next });
-    await refresh();
   };
 
-  const canvas = useMemo(() => {
-    if (!snap) return { w: 1920, h: 1080 };
-    return {
-      w: snap.status.canvas_width || 1920,
-      h: snap.status.canvas_height || 1080,
-    };
-  }, [snap]);
-
-  const scale = useMemo(() => {
-    const el = stageRef.current;
-    if (!el) return 0.25;
-    const rect = el.getBoundingClientRect();
-    return Math.min(rect.width / canvas.w, rect.height / canvas.h, 1);
-  }, [canvas, preview, snap]);
-
-  const onPointerDown = (e: React.PointerEvent, id: string) => {
+  const onPointerDown = (e: React.PointerEvent, id: string, mode: DragMode) => {
+    e.preventDefault();
+    e.stopPropagation();
     if (!config) return;
     const p = config.layout.placements.find((x) => x.monitor_id === id);
     if (!p) return;
     dragRef.current = {
       id,
-      ox: e.clientX - p.x * scale,
-      oy: e.clientY - p.y * scale,
+      mode,
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: p.x,
+      origY: p.y,
+      origScale: p.scale,
     };
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
-    if (!dragRef.current || !config) return;
-    const { id, ox, oy } = dragRef.current;
-    let x = Math.round((e.clientX - ox) / scale);
-    let y = Math.round((e.clientY - oy) / scale);
-    const grid = 16;
-    x = Math.round(x / grid) * grid;
-    y = Math.round(y / grid) * grid;
-    const placements = config.layout.placements.map((p) =>
-      p.monitor_id === id ? { ...p, x, y } : p
-    );
-    setConfig({ ...config, layout: { ...config.layout, placements } });
+    const drag = dragRef.current;
+    const cfg = configRef.current;
+    if (!drag || !cfg || !snap) return;
+    const dx = (e.clientX - drag.startX) / scale;
+    const dy = (e.clientY - drag.startY) / scale;
+    const mon = snap.monitors.find((m) => m.id === drag.id);
+    if (!mon) return;
+
+    const placements = cfg.layout.placements.map((p) => {
+      if (p.monitor_id !== drag.id) return p;
+      if (drag.mode === "move") {
+        let x = Math.round(drag.origX + dx);
+        let y = Math.round(drag.origY + dy);
+        const grid = 8;
+        x = Math.round(x / grid) * grid;
+        y = Math.round(y / grid) * grid;
+        return { ...p, x, y };
+      }
+      // resize from bottom-right: change scale
+      const baseW = mon.width;
+      const newW = Math.max(160, baseW * drag.origScale + dx);
+      const scaleVal = Math.max(0.25, Math.min(3, newW / baseW));
+      return { ...p, scale: Math.round(scaleVal * 100) / 100 };
+    });
+    setConfig({ ...cfg, layout: { ...cfg.layout, placements } });
   };
 
   const onPointerUp = async () => {
-    if (!dragRef.current || !config) return;
+    if (!dragRef.current || !configRef.current) return;
     dragRef.current = null;
-    await save(config);
+    await save(configRef.current);
+    await refresh();
   };
 
   const toggleMonitor = async (id: string) => {
@@ -104,12 +163,36 @@ export default function App() {
       p.monitor_id === id ? { ...p, enabled: !p.enabled } : p
     );
     const selected = placements.filter((p) => p.enabled).map((p) => p.monitor_id);
-    await save({ ...config, layout: { ...config.layout, placements }, selected_monitor_ids: selected });
+    await save({
+      ...config,
+      layout: { ...config.layout, placements },
+      selected_monitor_ids: selected,
+    });
+    await refresh();
   };
 
   const setMode = async (mode: OutputMode) => {
     if (!config) return;
     await save({ ...config, layout: { ...config.layout, mode } });
+    await refresh();
+  };
+
+  const setRadius = async (radius: number) => {
+    if (!config) return;
+    const next = {
+      ...config,
+      layout: {
+        ...config.layout,
+        follow: {
+          ...config.layout.follow,
+          radius,
+          width: radius * 2,
+          height: Math.max(180, Math.round(radius * 2 * 9 / 16)),
+        },
+      },
+    };
+    setConfig(next);
+    await invoke("save_config", { config: next });
   };
 
   const start = async () => {
@@ -141,6 +224,9 @@ export default function App() {
     );
   }
 
+  const follow = config.layout.follow;
+  const radius = follow.radius || Math.round((follow.width || 1920) / 2);
+
   return (
     <div className="app">
       <header className="topbar">
@@ -165,7 +251,9 @@ export default function App() {
             <>
               <button
                 onClick={() =>
-                  invoke("set_output_active", { active: !snap.status.output_active }).then(refresh)
+                  invoke("set_output_active", {
+                    active: !snap.status.output_active,
+                  }).then(refresh)
                 }
               >
                 {snap.status.output_active ? "Pause output" : "Resume output"}
@@ -179,45 +267,97 @@ export default function App() {
       <div className="main">
         <section className="preview-pane">
           <div className="preview-header">
-            <h2>Live preview</h2>
+            <h2>Layout editor</h2>
             <div className="preview-meta">
-              {snap.status.canvas_width}×{snap.status.canvas_height} ·{" "}
-              {snap.status.fps.toFixed(0)} fps ·{" "}
-              {config.layout.mode === "mouse_follow" ? "Mouse follow" : "Static layout"}
+              Canvas {canvasW}×{canvasH} · {snap.status.fps.toFixed(0)} fps ·{" "}
+              {snap.monitors.length} monitors
             </div>
           </div>
+
           <div
             className="preview-stage"
             ref={stageRef}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
+            onPointerLeave={onPointerUp}
           >
-            {preview ? <img src={preview} alt="Composite preview" /> : null}
-            <div className="overlay-tiles">
-              {config.layout.placements.map((p) => {
-                const mon = snap.monitors.find((m) => m.id === p.monitor_id);
-                if (!mon) return null;
-                const w = mon.width * p.scale * scale;
-                const h = mon.height * p.scale * scale;
-                return (
-                  <div
-                    key={p.monitor_id}
-                    className={`tile ${p.enabled ? "" : "disabled"}`}
-                    style={{
-                      left: p.x * scale,
-                      top: p.y * scale,
-                      width: Math.max(48, w),
-                      height: Math.max(36, h),
-                    }}
-                    onPointerDown={(e) => onPointerDown(e, p.monitor_id)}
-                  >
-                    {mon.name}
-                  </div>
-                );
-              })}
+            <div
+              className="canvas-world"
+              ref={worldRef}
+              style={{
+                width: canvasW * scale,
+                height: canvasH * scale,
+              }}
+            >
+              {layoutPreview ? (
+                <img
+                  className="canvas-image"
+                  src={layoutPreview}
+                  alt="Layout"
+                  draggable={false}
+                />
+              ) : (
+                <div className="canvas-placeholder" />
+              )}
+              <div className="overlay-tiles">
+                {config.layout.placements.map((p) => {
+                  const mon = snap.monitors.find((m) => m.id === p.monitor_id);
+                  if (!mon) return null;
+                  const w = mon.width * p.scale * scale;
+                  const h = mon.height * p.scale * scale;
+                  return (
+                    <div
+                      key={p.monitor_id}
+                      className={`tile ${p.enabled ? "" : "disabled"}`}
+                      style={{
+                        left: p.x * scale,
+                        top: p.y * scale,
+                        width: Math.max(40, w),
+                        height: Math.max(28, h),
+                      }}
+                      onPointerDown={(e) => onPointerDown(e, p.monitor_id, "move")}
+                    >
+                      <span className="tile-label">
+                        {mon.name}
+                        <small>
+                          {Math.round(mon.width * p.scale)}×
+                          {Math.round(mon.height * p.scale)}
+                        </small>
+                      </span>
+                      <div
+                        className="resize-handle"
+                        onPointerDown={(e) => onPointerDown(e, p.monitor_id, "resize")}
+                        title="Resize"
+                      />
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
-          {error ? <p className="hint" style={{ color: "var(--danger)" }}>{error}</p> : null}
+
+          <div className="output-dock">
+            <div className="output-dock-header">
+              <h2>Output preview</h2>
+              <span className="preview-meta">
+                {snap.status.output_width || "—"}×{snap.status.output_height || "—"}
+                {config.layout.mode === "mouse_follow" ? " · mouse follow" : " · static"}
+              </span>
+            </div>
+            <div className="output-frame">
+              {outputPreview ? (
+                <img src={outputPreview} alt="Stream output" draggable={false} />
+              ) : (
+                <p className="hint">Start capture to see the stream view</p>
+              )}
+            </div>
+          </div>
+
+          {error ? (
+            <p className="hint" style={{ color: "var(--danger)" }}>
+              {error}
+            </p>
+          ) : null}
         </section>
 
         <aside className="sidebar">
@@ -237,13 +377,34 @@ export default function App() {
                 Mouse follow
               </button>
             </div>
-            <p className="hint" style={{ marginTop: "0.75rem" }}>
-              Static streams the full arrangement. Mouse follow crops a viewport that tracks your cursor across monitors.
-            </p>
+            {config.layout.mode === "mouse_follow" ? (
+              <div className="slider-block">
+                <div className="row">
+                  <label>Maus-Radius</label>
+                  <span className="preview-meta">{radius}px</span>
+                </div>
+                <input
+                  type="range"
+                  min={240}
+                  max={1920}
+                  step={16}
+                  value={radius}
+                  onChange={(e) => setRadius(Number(e.target.value))}
+                />
+                <p className="hint">
+                  Sichtfeld um den Cursor ({radius * 2}×
+                  {Math.round(radius * 2 * 9 / 16)}). Live in der Output-Preview.
+                </p>
+              </div>
+            ) : (
+              <p className="hint" style={{ marginTop: "0.75rem" }}>
+                Ziehe Monitore im Layout-Editor. Rechts unten siehst du den Stream-Output.
+              </p>
+            )}
           </div>
 
           <div className="panel">
-            <h3>Monitors</h3>
+            <h3>Monitors ({snap.monitors.length})</h3>
             <div className="monitor-list">
               {snap.monitors.map((m) => {
                 const p = config.layout.placements.find((x) => x.monitor_id === m.id);
@@ -252,7 +413,7 @@ export default function App() {
                     <div>
                       <strong>{m.name}</strong>
                       <small>
-                        {m.width}×{m.height}@{m.refresh_hz}Hz
+                        {m.width}×{m.height} · ({m.x},{m.y})
                       </small>
                     </div>
                     <button
@@ -275,35 +436,7 @@ export default function App() {
           </div>
 
           <div className="panel">
-            <h3>Output size</h3>
-            <div className="row">
-              <label>Max width</label>
-              <input
-                type="number"
-                value={config.layout.max_width}
-                onChange={(e) =>
-                  setConfig({
-                    ...config,
-                    layout: { ...config.layout, max_width: Number(e.target.value) || 0 },
-                  })
-                }
-                onBlur={() => save(config)}
-              />
-            </div>
-            <div className="row">
-              <label>Max height</label>
-              <input
-                type="number"
-                value={config.layout.max_height}
-                onChange={(e) =>
-                  setConfig({
-                    ...config,
-                    layout: { ...config.layout, max_height: Number(e.target.value) || 0 },
-                  })
-                }
-                onBlur={() => save(config)}
-              />
-            </div>
+            <h3>Output</h3>
             <div className="row">
               <label>Target FPS</label>
               <input
@@ -315,54 +448,6 @@ export default function App() {
                 onBlur={() => save(config)}
               />
             </div>
-            {config.layout.mode === "mouse_follow" ? (
-              <>
-                <div className="row">
-                  <label>Follow W</label>
-                  <input
-                    type="number"
-                    value={config.layout.follow.width}
-                    onChange={(e) =>
-                      setConfig({
-                        ...config,
-                        layout: {
-                          ...config.layout,
-                          follow: {
-                            ...config.layout.follow,
-                            width: Number(e.target.value) || 1920,
-                          },
-                        },
-                      })
-                    }
-                    onBlur={() => save(config)}
-                  />
-                </div>
-                <div className="row">
-                  <label>Follow H</label>
-                  <input
-                    type="number"
-                    value={config.layout.follow.height}
-                    onChange={(e) =>
-                      setConfig({
-                        ...config,
-                        layout: {
-                          ...config.layout,
-                          follow: {
-                            ...config.layout.follow,
-                            height: Number(e.target.value) || 1080,
-                          },
-                        },
-                      })
-                    }
-                    onBlur={() => save(config)}
-                  />
-                </div>
-              </>
-            ) : null}
-          </div>
-
-          <div className="panel">
-            <h3>Channels</h3>
             <div className="row">
               <label>Share window</label>
               <button
@@ -381,29 +466,25 @@ export default function App() {
               </button>
             </div>
             <div className="row">
-              <label>Virtual camera</label>
+              <label>Fenster zeigen</label>
               <button
-                className={config.outputs.virtual_camera ? "active" : "ghost"}
+                className={config.outputs.show_share_window ? "active" : "ghost"}
                 onClick={() =>
                   save({
                     ...config,
                     outputs: {
                       ...config.outputs,
-                      virtual_camera: !config.outputs.virtual_camera,
+                      show_share_window: !config.outputs.show_share_window,
                     },
-                    virtual_camera: {
-                      ...config.virtual_camera,
-                      enabled: !config.outputs.virtual_camera,
-                    },
-                  })
+                  }).then(refresh)
                 }
               >
-                {config.outputs.virtual_camera ? "On" : "Off"}
+                {config.outputs.show_share_window ? "Sichtbar" : "Versteckt"}
               </button>
             </div>
             <p className="hint">
-              In Discord: Share screen → Application → <strong>kynxShare Output</strong>.
-              Optional VDD: {snap.vdd.installed ? "detected" : "not installed"}.
+              Output-Fenster bleibt standardmäßig versteckt. Für Discord kurz auf
+              „Sichtbar“ stellen und <em>kynxShare Output</em> als Fenster teilen.
             </p>
           </div>
         </aside>
@@ -414,13 +495,14 @@ export default function App() {
           <div className="wizard-card">
             <h2>Welcome to kynxShare</h2>
             <p className="hint">
-              Bundle any monitors into one streamable output. Drag tiles in the preview to arrange them.
+              Monitore im Layout-Editor verschieben und skalieren. Die Output-Preview
+              zeigt live, was gestreamt wird.
             </p>
             <ol>
-              <li>Enable the monitors you want to include.</li>
-              <li>Arrange them in the live preview (snap-to-grid).</li>
+              <li>Monitore aktivieren und anordnen.</li>
+              <li>Optional: Mouse-Follow mit Radius-Slider.</li>
               <li>
-                Start output, then in Discord pick window <em>kynxShare Output</em>.
+                Start → Discord: Fenster <em>kynxShare Output</em> (Fenster zeigen falls nötig).
               </li>
             </ol>
             <div className="wizard-actions">

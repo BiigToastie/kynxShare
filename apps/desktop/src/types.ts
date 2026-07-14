@@ -28,6 +28,7 @@ export interface MouseFollowConfig {
   height: number;
   edge_padding: number;
   smoothing: number;
+  radius: number;
 }
 
 export interface LayoutConfig {
@@ -45,6 +46,7 @@ export interface OutputChannels {
   share_window: boolean;
   virtual_camera: boolean;
   always_on_top: boolean;
+  show_share_window: boolean;
 }
 
 export interface AppConfig {
@@ -65,6 +67,8 @@ export interface EngineStatus {
   fps: number;
   canvas_width: number;
   canvas_height: number;
+  output_width: number;
+  output_height: number;
   monitor_count: number;
 }
 
@@ -79,5 +83,7 @@ export interface EngineSnapshot {
   monitors: MonitorInfo[];
   layout: LayoutConfig;
   vdd: VirtualDisplayStatus;
+  layout_preview_jpeg_base64: string | null;
+  output_preview_jpeg_base64: string | null;
   preview_jpeg_base64: string | null;
 }

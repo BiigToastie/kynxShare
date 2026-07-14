@@ -10,6 +10,9 @@ pub struct OutputChannels {
     pub share_window: bool,
     pub virtual_camera: bool,
     pub always_on_top: bool,
+    /// Show the Discord capture window on screen (off by default — stays hidden but capturable when shown)
+    #[serde(default)]
+    pub show_share_window: bool,
 }
 
 impl Default for OutputChannels {
@@ -18,6 +21,7 @@ impl Default for OutputChannels {
             share_window: true,
             virtual_camera: false,
             always_on_top: false,
+            show_share_window: false,
         }
     }
 }

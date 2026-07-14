@@ -37,6 +37,7 @@ pub fn run() {
             commands::toggle_mode,
             commands::refresh_monitors,
             commands::get_preview,
+            commands::get_output_preview,
             commands::get_vdd_status,
         ])
         .setup(|app| {
