@@ -31,10 +31,13 @@ Artifacts land in `target/release/bundle/` at the **repo root** (Cargo workspace
 
 ## Optional companion
 
-Virtual Display Driver (for Discord “Screen” source):
+Für Discord **Bildschirm**-Tab mit Performance-Optionen brauchst du den
+**Parsec Virtual Display Driver** (einmalig, Admin):
 
-```bash
-winget install --id=VirtualDrivers.Virtual-Display-Driver -e
-```
+https://builds.parsec.app/vdd/parsec-vdd-0.41.0.0.exe
 
-See `docs/discord.md`.
+Danach in kynxShare „Virtueller Bildschirm“ an → Stream starten → Discord listet
+den neuen Monitor. Details: `docs/discord.md`.
+
+Alternativ (ohne kynxShare-Steuerung):  
+`winget install --id=VirtualDrivers.Virtual-Display-Driver -e`
